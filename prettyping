@@ -4,9 +4,9 @@
 # MIT license
 #
 # Requirements:
-# * bash (tested on 4.20, should work on older versions too)
-# * awk (works with GNU awk, nawk, busybox awk, mawk)
-# * ping (from iputils)
+# * bash (3.2 or newer)
+# * awk (works with GNU awk, nawk/BWK awk, busybox awk, mawk)
+# * ping (from iputils, BSD/macOS, busybox, or any other with similar output)
 #
 # More information:
 # https://denilsonsa.github.io/prettyping/
@@ -14,58 +14,53 @@
 # https://old.reddit.com/r/linux/comments/1op98a/prettypingsh_a_better_ui_for_watching_ping/
 # Third-party demonstration video: https://www.youtube.com/watch?v=ziEMY1BcikM
 
-# TODO: Test in original-awk:
-#       https://aur.archlinux.org/packages/original-awk
-#       https://sources.debian.org/src/original-awk/
-# TODO: Adjust how many items in the legend are printed based on the terminal width.
-#
-# TODO: Detect the following kinds of message and avoid printing it repeatedly.
-# From 192.168.1.11: icmp_seq=4 Destination Host Unreachable
-# Request timeout for icmp_seq 378
-#
 # TODO: Handle when a single message is spread over multiple lines. Specially,
 # like in this case: https://bitbucket.org/denilsonsa/small_scripts/issue/5
 #
-# TODO: Print the destination (also) at the bottom bar. Useful after leaving
-# the script running for quite some time.
-#
-# TODO: Print the destination as escape codes to xterm title.
-#
-# TODO: Print the current time in the beginning of each line.
-#
 # TODO: Implement audible ping.
-#
-# TODO: Autodetect the width of printf numbers, so they will always line up correctly.
-#
-# TODO: Test the behavior of this script upon receiving out-of-order packets, like these:
-#   https://web.archive.org/web/20130531083142/http://www.blug.linux.no/rfc1149/pinglogg.txt
-#
-# TODO? How will prettyping behave if it receives a duplicate response?
+
+VERSION="2.0.0"
 
 print_help() {
 	cat << EOF
 Usage: $MYNAME [prettyping parameters] <standard ping parameters>
 
 This script is a wrapper around the system's "ping" tool. It will substitute
-each ping response line by a colored character, giving a very compact overview
-of the ping responses.
+each ping response line by a colored bar, giving a very compact overview of
+the ping responses.
+
+Each bar's height and color show the round-trip time on a logarithmic scale,
+which is set from the first reply unless --rttmin or --rttmax are given. Lost
+packets are drawn as red crosses. A live panel at the bottom shows the latest
+reply and the statistics, and a summary is printed when ping stops.
 
 prettyping parameters:
-  --[no]color        Enable/disable color output. (default: enabled)
-  --[no]multicolor   Enable/disable multi-color unicode output. Has no effect if
-                       either color or unicode is disabled. (default: enabled)
+  --[no]color        Enable/disable color output. (default: enabled, unless the
+                       NO_COLOR environment variable is set)
+  --colors <n>       Color depth: 16, 256 or 24 (truecolor). (default: auto)
+  --theme <t>        Colors for a dark or light background: dark, light or
+                       auto, which asks the terminal. (default: auto)
+  --[no]multicolor   Enable/disable the latency color gradient. Has no effect
+                       if color is disabled. (default: enabled)
   --[no]unicode      Enable/disable unicode characters. (default: enabled)
+  --[no]compact      Draw each row of bars one line tall instead of two.
+                       (default: disabled)
   --[no]legend       Enable/disable the latency legend. (default: enabled)
-  --[no]globalstats  Enable/disable the global statistics line. (default: enabled)
-  --[no]recentstats  Enable/disable the "last n" statistics line. (default: enabled)
+  --[no]globalstats  Enable/disable the session statistics. (default: enabled)
+  --[no]recentstats  Enable/disable the "last n" statistics. (default: enabled)
+  --[no]summary      Enable/disable the summary printed when ping stops.
+                       (default: enabled)
+  --[no]title        Enable/disable showing the latency in the terminal title.
+                       (default: enabled)
   --[no]terminal     Force the output designed to a terminal. (default: auto)
   --last <n>         Use the last "n" pings at the statistics line. (default: 60)
   --columns <n>      Override auto-detection of terminal dimensions.
   --lines <n>        Override auto-detection of terminal dimensions.
-  --rttmin <n>       Minimum RTT represented in the unicode graph. (default: auto)
-  --rttmax <n>       Maximum RTT represented in the unicode graph. (default: auto)
+  --rttmin <n>       Minimum RTT represented in the graph. (default: auto)
+  --rttmax <n>       Maximum RTT represented in the graph. (default: auto)
   --awkbin <exec>    Override the awk interpreter. (default: awk)
   --pingbin <exec>   Override the ping tool. (default: ping)
+  --version          Print the version and exit.
 
 ping parameters handled by prettyping:
   -a  Audible ping is not implemented yet.
@@ -78,21 +73,46 @@ All other parameters are passed directly to ping.
 EOF
 }
 
+is_uint() {
+	local re='^[0-9]+$'
+	[[ "$1" =~ $re ]]
+}
+
+is_number() {
+	local re='^([0-9]+[.]?[0-9]*|[.][0-9]+)$'
+	[[ "$1" =~ $re ]]
+}
+
+die() {
+	echo "${MYNAME}: $*" >&2
+	exit 1
+}
+
 # Thanks to people at #bash who pointed me at
 # https://web.archive.org/web/20100301171512/https://bash-hackers.org/wiki/doku.php/scripting/posparams
 parse_arguments() {
 	USE_COLOR=1
 	USE_MULTICOLOR=1
 	USE_UNICODE=1
+	USE_COMPACT=0
 	USE_LEGEND=1
 	USE_GLOBALSTATS=1
 	USE_RECENTSTATS=1
+	USE_SUMMARY=1
+	USE_TITLE=1
+	FORCED_COLOR=0
+	COLOR_DEPTH=auto
+	THEME=auto
 
 	if [ -t 1 ]; then
 		IS_TERMINAL=1
 	else
 		IS_TERMINAL=0
 	fi
+	# A terminal that cannot move its cursor gets the plain output.
+	case "${TERM:-dumb}" in
+		dumb ) IS_TERMINAL=0 ;;
+	esac
 
 	LAST_N=60
 	OVERRIDE_COLUMNS=0
@@ -101,7 +121,7 @@ parse_arguments() {
 	RTT_MAX=auto
 
 	PING_BIN="ping"
-	#PING_BIN="./mockping.awk"
+	#PING_BIN="./mockping.sh"
 	PING_PARAMS=( )
 
 	AWK_BIN="awk"
@@ -113,20 +133,21 @@ parse_arguments() {
 				print_help
 				exit
 				;;
+			-version | --version )
+				echo "prettyping ${VERSION}"
+				exit
+				;;
 
 			# Forbidden ping parameters within prettyping:
 			-f )
-				echo "${MYNAME}: You can't use the -f (flood) option."
-				exit 1
+				die "You can't use the -f (flood) option."
 				;;
 			-R )
 				# -R prints extra information at each ping response.
-				echo "${MYNAME}: You can't use the -R (record route) option."
-				exit 1
+				die "You can't use the -R (record route) option."
 				;;
 			-q )
-				echo "${MYNAME}: You can't use the -q (quiet) option."
-				exit 1
+				die "You can't use the -q (quiet) option."
 				;;
 			-v )
 				# -v enables verbose output. However, it seems the output with
@@ -142,30 +163,52 @@ parse_arguments() {
 				# TODO: Implement audible ping for responses or for missing packets
 				;;
 
-			-color         | --color         ) USE_COLOR=1 ;;
+			-color         | --color         ) USE_COLOR=1 ; FORCED_COLOR=1 ;;
 			-nocolor       | --nocolor       ) USE_COLOR=0 ;;
 			-multicolor    | --multicolor    ) USE_MULTICOLOR=1 ;;
 			-nomulticolor  | --nomulticolor  ) USE_MULTICOLOR=0 ;;
 			-unicode       | --unicode       ) USE_UNICODE=1 ;;
 			-nounicode     | --nounicode     ) USE_UNICODE=0 ;;
+			-compact       | --compact       ) USE_COMPACT=1 ;;
+			-nocompact     | --nocompact     ) USE_COMPACT=0 ;;
 			-legend        | --legend        ) USE_LEGEND=1 ;;
 			-nolegend      | --nolegend      ) USE_LEGEND=0 ;;
 			-globalstats   | --globalstats   ) USE_GLOBALSTATS=1 ;;
 			-noglobalstats | --noglobalstats ) USE_GLOBALSTATS=0 ;;
 			-recentstats   | --recentstats   ) USE_RECENTSTATS=1 ;;
 			-norecentstats | --norecentstats ) USE_RECENTSTATS=0 ;;
+			-summary       | --summary       ) USE_SUMMARY=1 ;;
+			-nosummary     | --nosummary     ) USE_SUMMARY=0 ;;
+			-title         | --title         ) USE_TITLE=1 ;;
+			-notitle       | --notitle       ) USE_TITLE=0 ;;
 			-terminal      | --terminal      ) IS_TERMINAL=1 ;;
 			-noterminal    | --noterminal    ) IS_TERMINAL=0 ;;
 
-			-awkbin  | --awkbin  ) AWK_BIN="$2"  ; shift ;;
-			-pingbin | --pingbin ) PING_BIN="$2" ; shift ;;
-
-			#TODO: Check if these parameters are numbers.
-			-last    | --last    ) LAST_N="$2"           ; shift ;;
-			-columns | --columns ) OVERRIDE_COLUMNS="$2" ; shift ;;
-			-lines   | --lines   ) OVERRIDE_LINES="$2"   ; shift ;;
-			-rttmin  | --rttmin  ) RTT_MIN="$2"          ; shift ;;
-			-rttmax  | --rttmax  ) RTT_MAX="$2"          ; shift ;;
+			-awkbin  | --awkbin  | \
+			-pingbin | --pingbin | \
+			-colors  | --colors  | \
+			-theme   | --theme   | \
+			-last    | --last    | \
+			-columns | --columns | \
+			-lines   | --lines   | \
+			-rttmin  | --rttmin  | \
+			-rttmax  | --rttmax  )
+				if [[ $# -lt 2 ]] ; then
+					die "The $1 option needs a value."
+				fi
+				case "$1" in
+					*awkbin  ) AWK_BIN="$2" ;;
+					*pingbin ) PING_BIN="$2" ;;
+					*colors  ) COLOR_DEPTH="$2" ;;
+					*theme   ) THEME="$2" ;;
+					*last    ) LAST_N="$2" ;;
+					*columns ) OVERRIDE_COLUMNS="$2" ;;
+					*lines   ) OVERRIDE_LINES="$2" ;;
+					*rttmin  ) RTT_MIN="$2" ;;
+					*rttmax  ) RTT_MAX="$2" ;;
+				esac
+				shift
+				;;
 
 			* )
 				PING_PARAMS+=("$1")
@@ -174,15 +217,76 @@ parse_arguments() {
 		shift
 	done
 
-	if [[ "${RTT_MIN}" -gt 0 && "${RTT_MAX}" -gt 0 && "${RTT_MIN}" -ge "${RTT_MAX}" ]] ; then
-		echo "${MYNAME}: Invalid --rttmin and -rttmax values."
-		exit 1
+	is_uint "${LAST_N}"           || die "Invalid --last value: ${LAST_N}"
+	is_uint "${OVERRIDE_COLUMNS}" || die "Invalid --columns value: ${OVERRIDE_COLUMNS}"
+	is_uint "${OVERRIDE_LINES}"   || die "Invalid --lines value: ${OVERRIDE_LINES}"
+	[[ "${RTT_MIN}" = auto ]] && RTT_MIN=0
+	[[ "${RTT_MAX}" = auto ]] && RTT_MAX=0
+	is_number "${RTT_MIN}" || die "Invalid --rttmin value: ${RTT_MIN}"
+	is_number "${RTT_MAX}" || die "Invalid --rttmax value: ${RTT_MAX}"
+	if ! command -v "${AWK_BIN}" > /dev/null 2>&1 ; then
+		die "Cannot find the awk interpreter: ${AWK_BIN}"
+	fi
+	if ! "${AWK_BIN}" -v a="${RTT_MIN}" -v b="${RTT_MAX}" 'BEGIN { exit !(a <= 0 || b <= 0 || a < b) }' ; then
+		die "Invalid --rttmin and --rttmax values."
+	fi
+
+	case "${COLOR_DEPTH}" in
+		16 | 256 ) ;;
+		24 | 24bit | truecolor | true ) COLOR_DEPTH=24 ;;
+		auto )
+			case "${COLORTERM}" in
+				truecolor | 24bit ) COLOR_DEPTH=24 ;;
+				* )
+					case "${TERM}" in
+						*-direct* ) COLOR_DEPTH=24 ;;
+						*256col* ) COLOR_DEPTH=256 ;;
+						* ) COLOR_DEPTH=16 ;;
+					esac
+					;;
+			esac
+			;;
+		* ) die "Invalid --colors value: ${COLOR_DEPTH} (use 16, 256 or 24)" ;;
+	esac
+
+	case "${THEME}" in
+		auto | dark | light ) ;;
+		* ) die "Invalid --theme value: ${THEME} (use dark, light or auto)" ;;
+	esac
+
+	# https://no-color.org/
+	if [[ -n "${NO_COLOR}" && "${FORCED_COLOR}" = 0 ]] ; then
+		USE_COLOR=0
 	fi
 
 	if [[ "${#PING_PARAMS[@]}" = 0 ]] ; then
-		echo "${MYNAME}: Missing parameters, use --help for instructions."
-		exit 1
+		die "Missing parameters, use --help for instructions."
 	fi
+
+	# A few ping parameters change how the output should be read: the packet
+	# count, the interval, and the destination (in case ping never prints its
+	# own header, which ping6 does not do while nothing comes back).
+	COUNT=0
+	INTERVAL=1
+	TARGET=""
+	local i p skip=0
+	for (( i = 0 ; i < ${#PING_PARAMS[@]} ; i++ )) ; do
+		p="${PING_PARAMS[i]}"
+		if [[ "${skip}" = 1 ]] ; then
+			skip=0
+			continue
+		fi
+		case "${p}" in
+			-c ) COUNT="${PING_PARAMS[i+1]}" ; skip=1 ;;
+			-c* ) COUNT="${p#-c}" ;;
+			-i ) INTERVAL="${PING_PARAMS[i+1]}" ; skip=1 ;;
+			-i* ) INTERVAL="${p#-i}" ;;
+			-* ) ;;
+			* ) is_number "${p}" || TARGET="${p}" ;;
+		esac
+	done
+	is_uint "${COUNT}" || COUNT=0
+	is_number "${INTERVAL}" || INTERVAL=1
 
 	# Workaround for mawk:
 	# https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=593504
@@ -192,11 +296,2340 @@ parse_arguments() {
 	fi
 }
 
+# While the graph is being drawn, typed characters (and the ^C echo) would be
+# printed over it, and ^C would make the terminal drop output that awk already
+# wrote. Both are switched off until prettyping exits. stty works on its
+# standard input, hence /dev/tty: stdin may well be something else.
+prepare_terminal() {
+	SAVED_STTY=""
+	if [[ "${IS_TERMINAL}" = 1 && -t 1 ]] ; then
+		SAVED_STTY="$(stty -g 2> /dev/null < /dev/tty)"
+	fi
+	if [[ -n "${SAVED_STTY}" ]] ; then
+		stty -echo 2> /dev/null < /dev/tty
+		stty noflsh 2> /dev/null < /dev/tty
+	fi
+
+	# The awk side animates the status panel on these ticks.
+	TICK=1
+	if [[ "${IS_TERMINAL}" = 1 ]] && sleep 0.01 2> /dev/null ; then
+		TICK=0.25
+	fi
+}
+
+# Keys typed while echo was off were never shown: they are dropped, rather
+# than handed to the shell to run.
+discard_typeahead() {
+	stty -icanon min 0 time 0 2> /dev/null < /dev/tty && cat > /dev/null 2>&1 < /dev/tty
+}
+
+restore_terminal() {
+	if [[ -n "${SAVED_STTY}" ]] ; then
+		discard_typeahead
+		stty "${SAVED_STTY}" 2> /dev/null < /dev/tty
+	fi
+	if [[ "${IS_TERMINAL}" = 1 ]] ; then
+		# awk shows the cursor again on its way out, unless it was killed.
+		printf '\033[?25h'
+	fi
+}
+
+# Killed (by timeout(1), or the terminal going away): leave the terminal as it
+# was. bash runs this once the pipeline is gone, which happens at once when
+# the signal went to all of it.
+on_fatal_signal() {
+	trap '' TTOU
+	restore_terminal
+	if [[ "${IS_TERMINAL}" = 1 && "${USE_TITLE}" = 1 ]] ; then
+		printf '\033[23;2t'
+	fi
+	exit "$1"
+}
+
+# ^Z: give the terminal back as it was, then stop the whole pipeline.
+on_tstp() {
+	if [[ -n "${SAVED_STTY}" ]] ; then
+		discard_typeahead
+		stty "${SAVED_STTY}" 2> /dev/null < /dev/tty
+	fi
+	printf '\033[?25h' 2> /dev/null > /dev/tty
+	if [[ "${USE_TITLE}" = 1 ]] ; then
+		printf '\033[23;2t' 2> /dev/null > /dev/tty
+	fi
+	kill -STOP 0
+}
+
+# fg: take the terminal again, and tell awk to carry on below whatever the
+# shell printed in the meantime.
+on_cont() {
+	if [[ -n "${SAVED_STTY}" ]] ; then
+		stty -echo 2> /dev/null < /dev/tty
+		stty noflsh 2> /dev/null < /dev/tty
+	fi
+	echo SIGCONT
+}
+
+# For --theme auto: is the terminal background light or dark? COLORFGBG says
+# so in some terminals; otherwise the terminal is asked (OSC 11), and most
+# answer within milliseconds. Without an answer, it is dark.
+detect_theme() {
+	local bg saved reply re r g b
+	if [[ "${THEME}" != auto ]] ; then
+		return
+	fi
+	THEME=dark
+	if [[ -n "${COLORFGBG}" ]] ; then
+		bg="${COLORFGBG##*;}"
+		case "${bg}" in
+			7 | 9 | 1[0-5] ) THEME=light ;;
+		esac
+		return
+	fi
+	if [[ "${IS_TERMINAL}" != 1 || "${USE_COLOR}" != 1 || ! -t 1 ]] ; then
+		return
+	fi
+	saved="$(stty -g 2> /dev/null < /dev/tty)"
+	if [[ -z "${saved}" ]] ; then
+		return
+	fi
+	# Wait at most 0.2 s for the answer.
+	stty -echo -icanon min 0 time 2 2> /dev/null < /dev/tty || return
+	printf '\033]11;?\033\\' 2> /dev/null > /dev/tty
+	reply="$(dd bs=64 count=1 2> /dev/null < /dev/tty)"
+	stty "${saved}" 2> /dev/null < /dev/tty
+	re='rgb:([0-9a-fA-F]+)/([0-9a-fA-F]+)/([0-9a-fA-F]+)'
+	if [[ "${reply}" =~ ${re} ]] ; then
+		r=$(( 16#${BASH_REMATCH[1]:0:2} ))
+		g=$(( 16#${BASH_REMATCH[2]:0:2} ))
+		b=$(( 16#${BASH_REMATCH[3]:0:2} ))
+		if (( r * 299 + g * 587 + b * 114 > 128000 )) ; then
+			THEME=light
+		fi
+	fi
+}
+
 MYNAME=`basename "$0"`
 parse_arguments "$@"
+detect_theme
 
 
 export LC_ALL=C
+
+# The awk program, which reads the output of ping and draws everything. It is
+# a single-quoted string, so it must never contain an apostrophe, not even in
+# a comment. (Keeping it in a variable also keeps it out of the job notices
+# bash prints when a member of the pipeline dies.)
+AWK_PROG='
+############################################################
+# Small helpers
+
+# Weird that awk does not come with abs(), so I need to implement it.
+function abs(x) {
+	return ( (x < 0) ? -x : x )
+}
+
+function lesser(a, b) {
+	return (a < b) ? a : b
+}
+
+function greater(a, b) {
+	return (a > b) ? a : b
+}
+
+# Repeats s, n times.
+function rep(s, n,   r) {
+	r = ""
+	while ( n-- > 0 ) r = r s
+	return r
+}
+
+# Display width of s, which must not contain escape codes. With LC_ALL=C awk
+# counts bytes, so the UTF-8 continuation bytes are discounted. Every glyph
+# printed by this script is one column wide.
+function vis(s,   t) {
+	t = s
+	return length(s) - gsub(/[\200-\277]/, "", t)
+}
+
+function lpad(s, w) {
+	return rep(" ", w - vis(s)) s
+}
+
+function rpad(s, w) {
+	return s rep(" ", w - vis(s))
+}
+
+# Text that came from outside (host names, ping messages) is printed as plain
+# ASCII, so that it can neither move the cursor nor break the layout.
+function sanitize(s) {
+	gsub(/[^ -~]/, "?", s)
+	return s
+}
+
+# Cuts s (no escape codes) to w columns, cell by cell, so that no UTF-8
+# character is split.
+function cut(s, w,   n, k, i, out) {
+	if ( w <= 0 ) return ""
+	if ( vis(s) <= w ) return s
+	n = cells_of(s, CUTC)
+	k = (w <= length(G_ELLIPSIS_A)) ? w : w - length(G_ELLIPSIS_A)
+	out = ""
+	for ( i = 1 ; i <= k && i <= n ; i++ ) out = out CUTC[i]
+	return (k < w) ? out G_ELLIPSIS_A : out
+}
+
+# Three significant digits: 0.523, 5.23, 52.3, 523, 5230.
+function fmt3(x) {
+	if ( x < 0 ) x = 0
+	if ( x < 0.9995 ) return sprintf("%.3f", x)
+	if ( x < 9.995 ) return sprintf("%.2f", x)
+	if ( x < 99.95 ) return sprintf("%.1f", x)
+	return sprintf("%d", int(x + 0.5))
+}
+
+# Percentages: 0%, 0.40%, 2.5%, 12%, 99.6%, 100%.
+function fmt_pct(p) {
+	if ( p <= 0 ) return "0%"
+	if ( p >= 100 ) return "100%"
+	if ( p < 0.01 ) return "<0.01%"
+	if ( p < 1 ) return sprintf("%.2f%%", p)
+	if ( p < 10 ) return sprintf("%.1f%%", p)
+	if ( p < 99 ) return sprintf("%d%%", int(p + 0.5))
+	return sprintf("%.1f%%", p)
+}
+
+# Milliseconds for the scale and the histogram: 0.5 ms, 20 ms, 2 s.
+function fmt_ms(x) {
+	if ( x >= 1000 ) return fmt_num(x / 1000) " s"
+	return fmt_num(x) " ms"
+}
+
+function fmt_num(x) {
+	return sprintf("%g", x)
+}
+
+function fmt_dur(s) {
+	s = int(s)
+	if ( s < 60 ) return s "s"
+	if ( s < 3600 ) return int(s / 60) "m" sprintf("%02d", s % 60) "s"
+	if ( s < 86400 ) return int(s / 3600) "h" sprintf("%02d", int(s / 60) % 60) "m"
+	return int(s / 86400) "d" sprintf("%02d", int(s / 3600) % 24) "h"
+}
+
+# Largest power of ten not above x, as an exponent.
+function floor_log10(x,   e) {
+	e = int(log(x) / LOG10)
+	if ( 10 ^ e > x ) e--
+	if ( 10 ^ (e + 1) <= x ) e++
+	return e
+}
+
+# Rounds x down (or up) to a round number: 1, 1.2, 1.5, 2, 2.5, 3, 4, 5, 6
+# or 8 times a power of ten.
+function nice(x, up,   f, m, i) {
+	f = 10 ^ floor_log10(x)
+	m = x / f
+	if ( up ) {
+		for ( i = 1 ; i <= NICE_N ; i++ ) if ( NICE[i] >= m - 0.0001 ) return NICE[i] * f
+		return 10 * f
+	}
+	for ( i = NICE_N ; i > 1 ; i-- ) if ( NICE[i] <= m + 0.0001 ) return NICE[i] * f
+	return f
+}
+
+# Sorts a[1..n] in place (Shell sort, as awk has no portable sort).
+function sort_n(a, n,   gap, i, j, t) {
+	for ( gap = int(n / 2) ; gap > 0 ; gap = int(gap / 2) ) {
+		for ( i = gap + 1 ; i <= n ; i++ ) {
+			t = a[i]
+			for ( j = i ; j > gap && a[j - gap] > t ; j -= gap ) {
+				a[j] = a[j - gap]
+			}
+			a[j] = t
+		}
+	}
+}
+
+############################################################
+# Clock
+
+# Seconds since the epoch. Plain awk has no clock, but srand() returns the
+# previous seed, and srand() without an argument seeds from the time of day.
+# mawk seeds with nanoseconds, hence the scaling. If even that does not give
+# a sane value, date(1) is asked instead.
+function now(   t, cmd) {
+	if ( CLOCK_SRAND ) {
+		srand()
+		t = srand()
+		while ( t > 1e11 ) t /= 1000
+		return t
+	}
+	cmd = "date +%s"
+	t = 0
+	cmd | getline t
+	close(cmd)
+	return t + 0
+}
+
+# Refreshes NOW, but without starting a date process for every reply.
+function refresh_now() {
+	if ( CLOCK_SRAND || !IS_TERMINAL || NOW == 0 ) NOW = now()
+}
+
+function clock_init(   cmd, d, D, t) {
+	cmd = "date \"+%s %H %M %S\""
+	d = ""
+	cmd | getline d
+	close(cmd)
+	split(d, D, " ")
+	EPOCH0 = D[1] + 0
+	if ( EPOCH0 > 1e9 ) {
+		TZOFF = (D[2] * 3600 + D[3] * 60 + D[4]) - (EPOCH0 % 86400)
+		while ( TZOFF > 50400 ) TZOFF -= 86400
+		while ( TZOFF < -50400 ) TZOFF += 86400
+	} else {
+		TZOFF = 0
+	}
+	CLOCK_SRAND = 1
+	t = now()
+	if ( t < 1e9 || (EPOCH0 > 1e9 && abs(t - EPOCH0) > 5) ) CLOCK_SRAND = 0
+	NOW = now()
+	START_T = NOW
+}
+
+# Local time of day, HH:MM:SS.
+function clock(t,   s) {
+	s = (int(t) + TZOFF) % 86400
+	if ( s < 0 ) s += 86400
+	return sprintf("%02d:%02d:%02d", int(s / 3600), int(s / 60) % 60, s % 60)
+}
+
+############################################################
+# Colors
+
+# Escape code for a 24-bit color (bg=1 for the background), reduced to the
+# 256-color palette when the terminal cannot show more.
+function rgb(r, g, b, bg) {
+	if ( !USE_COLOR ) return ""
+	r = int(r) ; g = int(g) ; b = int(b)
+	if ( DEPTH == 24 ) return CSI (bg ? "48" : "38") ";2;" r ";" g ";" b "m"
+	return CSI (bg ? "48" : "38") ";5;" cube256(r, g, b) "m"
+}
+
+function cube256(r, g, b,   gray, i) {
+	if ( greater(r, greater(g, b)) - lesser(r, lesser(g, b)) < 32 ) {
+		gray = (r + g + b) / 3
+		if ( gray < 4 ) return 16
+		if ( gray > 246 ) return 231
+		i = int((gray - 8) / 10 + 0.5)
+		if ( i < 0 ) i = 0
+		if ( i > 23 ) i = 23
+		return 232 + i
+	}
+	return 16 + 36 * c6(r) + 6 * c6(g) + c6(b)
+}
+
+function c6(v) {
+	if ( v < 48 ) return 0
+	if ( v < 115 ) return 1
+	return int((v - 35) / 40)
+}
+
+# A color for the interface: an RGB value, or the given SGR attributes on a
+# 16-color terminal.
+function ui(r, g, b, basic) {
+	if ( !USE_COLOR ) return ""
+	if ( DEPTH == 16 ) return CSI basic "m"
+	return rgb(r, g, b, 0)
+}
+
+# The latency gradient: p goes from 0 (fast, cool colors) to 1 (slow, hot).
+function heat(p,   i, f) {
+	if ( !USE_COLOR ) return ""
+	if ( !USE_MULTICOLOR ) p = 0.25
+	if ( p < 0 ) p = 0
+	if ( p > 1 ) p = 1
+	if ( DEPTH == 16 ) {
+		# Red is kept for lost packets.
+		if ( p < 0.45 ) return CSI "32m"
+		if ( p < 0.68 ) return CSI "33m"
+		return CSI "35m"
+	}
+	i = 1
+	while ( i < HEAT_N - 1 && p > HEAT_P[i] ) i++
+	f = (p - HEAT_P[i - 1]) / (HEAT_P[i] - HEAT_P[i - 1])
+	return rgb(HEAT_R[i - 1] + (HEAT_R[i] - HEAT_R[i - 1]) * f, \
+	           HEAT_G[i - 1] + (HEAT_G[i] - HEAT_G[i - 1]) * f, \
+	           HEAT_B[i - 1] + (HEAT_B[i] - HEAT_B[i - 1]) * f, 0)
+}
+
+function heat_stop(p, r, g, b) {
+	HEAT_P[HEAT_N] = p
+	HEAT_R[HEAT_N] = r
+	HEAT_G[HEAT_N] = g
+	HEAT_B[HEAT_N] = b
+	HEAT_N++
+}
+
+function init_colors() {
+	ESC = sprintf("%c", 27)
+	CSI = ESC "["
+	BEL = sprintf("%c", 7)
+
+	HEAT_N = 0
+	if ( THEME == "light" ) {
+		# Darker shades of the same hues, readable on white.
+		heat_stop(0.00,   8, 145, 178)  # cyan
+		heat_stop(0.25,   5, 150, 105)  # emerald
+		heat_stop(0.45, 101, 163,  13)  # lime
+		heat_stop(0.60, 161,  98,   7)  # amber
+		heat_stop(0.75, 234,  88,  12)  # orange
+		heat_stop(0.88, 225,  29,  72)  # rose
+		heat_stop(1.00, 192,  38, 211)  # fuchsia
+	} else {
+		heat_stop(0.00,  34, 211, 238)  # cyan
+		heat_stop(0.25,  52, 211, 153)  # emerald
+		heat_stop(0.45, 163, 230,  53)  # lime
+		heat_stop(0.60, 250, 204,  21)  # yellow
+		heat_stop(0.75, 251, 146,  60)  # orange
+		heat_stop(0.88, 244,  63,  94)  # rose
+		heat_stop(1.00, 217,  70, 239)  # fuchsia
+	}
+
+	if ( !USE_COLOR ) return
+
+	RST  = CSI "0m"
+	BOLD = CSI "1m"
+
+	# Mid-tone grays, readable on both dark and light backgrounds.
+	C_FRAME = ui( 92, 101, 117, "2")
+	C_LABEL = ui(128, 137, 152, "2")
+	C_DIM   = ui(105, 113, 128, "2")
+	C_TEXT  = CSI "39m"
+
+	if ( THEME == "light" ) {
+		# On white, the dot glows darker.
+		C_OK     = ui(  5, 150, 105, "32")
+		C_OK_MID = ui(  4, 120,  87, "32")
+		C_OK_HI  = ui(  6,  95,  70, "1;32")
+		C_WARN   = ui(180,  83,   9, "33")
+		C_BAD    = ui(220,  38,  38, "31")
+	} else {
+		C_OK     = ui( 52, 211, 153, "32")
+		C_OK_MID = ui(110, 231, 183, "32")
+		C_OK_HI  = ui(187, 247, 208, "1;32")
+		C_WARN   = ui(251, 191,  36, "33")
+		C_BAD    = ui(248, 113, 113, "31")
+	}
+
+	if ( DEPTH == 16 ) {
+		# The cross in the background color of the terminal, on red.
+		C_LOST   = CSI "7;31m"
+		C_LOSTBG = CSI "41m"
+	} else if ( THEME == "light" ) {
+		C_LOST   = rgb(185, 28, 28, 0) rgb(254, 202, 202, 1)
+		C_LOSTBG = rgb(254, 202, 202, 1)
+	} else {
+		C_LOST   = rgb(255, 107, 107, 0) rgb(96, 22, 36, 1)
+		C_LOSTBG = rgb(96, 22, 36, 1)
+	}
+}
+
+############################################################
+# Glyphs
+
+function init_glyphs(   i) {
+	if ( USE_UNICODE ) {
+		split("▁ ▂ ▃ ▄ ▅ ▆ ▇ █", BLK, " ")
+		split("▏ ▎ ▍ ▌ ▋ ▊ ▉ █", EIGHTH, " ")
+		split("⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏", SPIN, " ")
+		SPIN_N = 10
+		G_H = "─" ; G_V = "│"
+		G_TL = "╭" ; G_TR = "╮" ; G_BL = "╰" ; G_BR = "╯"
+		G_AXIS = "│"
+		G_LOST = "✕" ; G_DOT = "●" ; G_DIAMOND = "◆" ; G_WARN = "▲"
+		G_SEP = "·" ; G_ARROW = "→" ; G_DASH = "–" ; G_ELLIPSIS = "…"
+		G_MOS_ON = "▰" ; G_MOS_OFF = "▱" ; G_TIMES = "×"
+	} else {
+		split("_ _ . . o o O O", BLK, " ")
+		for ( i = 1 ; i <= 8 ; i++ ) EIGHTH[i] = (i < 8) ? "" : "#"
+		split("| / - \\", SPIN, " ")
+		SPIN_N = 4
+		G_H = "-" ; G_V = "|"
+		G_TL = "+" ; G_TR = "+" ; G_BL = "+" ; G_BR = "+"
+		G_AXIS = "|"
+		G_LOST = "!" ; G_DOT = "*" ; G_DIAMOND = "*" ; G_WARN = "!"
+		G_SEP = "-" ; G_ARROW = "->" ; G_DASH = "-" ; G_ELLIPSIS = "..."
+		G_MOS_ON = "#" ; G_MOS_OFF = "." ; G_TIMES = "x"
+	}
+	G_ELLIPSIS_A = "..."
+
+	# Digits three cells wide and three lines tall, drawn with box-drawing
+	# characters, for the latest reply in the panel and the summary.
+	BIG["0", 1] = "┏━┓" ; BIG["0", 2] = "┃ ┃" ; BIG["0", 3] = "┗━┛"
+	BIG["1", 1] = "╺┓ " ; BIG["1", 2] = " ┃ " ; BIG["1", 3] = "╺┻╸"
+	BIG["2", 1] = "╺━┓" ; BIG["2", 2] = "┏━┛" ; BIG["2", 3] = "┗━╸"
+	BIG["3", 1] = "╺━┓" ; BIG["3", 2] = "╺━┫" ; BIG["3", 3] = "╺━┛"
+	BIG["4", 1] = "╻ ╻" ; BIG["4", 2] = "┗━┫" ; BIG["4", 3] = "  ╹"
+	BIG["5", 1] = "┏━╸" ; BIG["5", 2] = "┗━┓" ; BIG["5", 3] = "╺━┛"
+	BIG["6", 1] = "┏━╸" ; BIG["6", 2] = "┣━┓" ; BIG["6", 3] = "┗━┛"
+	BIG["7", 1] = "╺━┓" ; BIG["7", 2] = "  ┃" ; BIG["7", 3] = "  ╹"
+	BIG["8", 1] = "┏━┓" ; BIG["8", 2] = "┣━┫" ; BIG["8", 3] = "┗━┛"
+	BIG["9", 1] = "┏━┓" ; BIG["9", 2] = "┗━┫" ; BIG["9", 3] = "╺━┛"
+	BIG[".", 1] = " "   ; BIG[".", 2] = " "   ; BIG[".", 3] = "•"
+	BIG["-", 1] = "   " ; BIG["-", 2] = "╺━╸" ; BIG["-", 3] = "   "
+}
+
+# Renders str (digits, dots and dashes) as big digits into BIG1, BIG2 and
+# BIG3, and returns their width.
+function big(str,   i, ch, w) {
+	BIG1 = BIG2 = BIG3 = ""
+	w = 0
+	for ( i = 1 ; i <= length(str) ; i++ ) {
+		ch = substr(str, i, 1)
+		BIG1 = BIG1 BIG[ch, 1] ; BIG2 = BIG2 BIG[ch, 2] ; BIG3 = BIG3 BIG[ch, 3]
+		w += vis(BIG[ch, 1])
+	}
+	return w
+}
+
+############################################################
+# Building lines that contain escape codes, while keeping count of their
+# visible width (in LW).
+
+function lb() {
+	LS = ""
+	LW = 0
+}
+
+# Appends plain text s, in color c.
+function la(s, c) {
+	if ( s == "" ) return
+	LS = LS c s ((c != "") ? RST : "")
+	LW += vis(s)
+}
+
+# Appends a string that already contains escape codes and is w columns wide.
+function lraw(s, w) {
+	LS = LS s RST
+	LW += w
+}
+
+function lpadto(w) {
+	if ( LW < w ) {
+		LS = LS rep(" ", w - LW)
+		LW = w
+	}
+}
+
+function lfill(w, g, c) {
+	if ( LW < w ) la(rep(g, w - LW), c)
+}
+############################################################
+# Terminal size
+
+function get_terminal_size(   size, parts, cmd) {
+	cmd = "stty size 2> /dev/null < /dev/tty"
+	size = ""
+	cmd | getline size
+	close(cmd)
+
+	if ( split(size, parts, " ") != 2 || parts[1] + 0 <= 0 ) {
+		cmd = "stty -f /dev/tty size 2> /dev/null"
+		size = ""
+		cmd | getline size
+		close(cmd)
+		split(size, parts, " ")
+	}
+	if ( parts[1] + 0 <= 0 ) {
+		# No controlling terminal, but stderr is usually still the screen.
+		cmd = "stty size <&2 2> /dev/null"
+		size = ""
+		cmd | getline size
+		close(cmd)
+		split(size, parts, " ")
+	}
+	if ( parts[1] + 0 > 0 && parts[2] + 0 > 0 ) {
+		LINES   = int(parts[1])
+		COLUMNS = int(parts[2])
+	} else {
+		cmd = "tput lines 2> /dev/null"
+		if ( (cmd | getline size) == 1 && size + 0 > 0 ) LINES = int(size)
+		close(cmd)
+		cmd = "tput cols 2> /dev/null"
+		if ( (cmd | getline size) == 1 && size + 0 > 0 ) COLUMNS = int(size)
+		close(cmd)
+	}
+
+	if ( OVERRIDE_COLUMNS > 0 ) COLUMNS = OVERRIDE_COLUMNS
+	if ( OVERRIDE_LINES   > 0 ) LINES   = OVERRIDE_LINES
+
+	# Nothing is ever printed in the last column: a character there leaves
+	# the cursor waiting to wrap, and the next move would land a line lower.
+	W = COLUMNS - 1
+}
+
+############################################################
+# The latency scale: logarithmic, from SCALE_LO to SCALE_HI milliseconds.
+
+function set_scale(lo, hi) {
+	if ( lo <= 0 ) lo = 0.01
+	if ( hi <= lo ) hi = lo * 40
+	SCALE_LO = lo
+	SCALE_HI = hi
+	SCALE_L0 = log(lo)
+	SCALE_SPAN = log(hi) - SCALE_L0
+	SCALE_SET = 1
+}
+
+# Without --rttmin/--rttmax, the scale is set from the first reply: it sits a
+# quarter of the way up the bars, leaving room for jitter below and for
+# spikes up to about 7 times as slow above.
+function scale_auto(rtt) {
+	if ( rtt < 0.02 ) rtt = 0.02
+	set_scale(nice(rtt / 1.6, 0), nice(rtt * 7.5, 1))
+}
+
+function pos(rtt) {
+	if ( !SCALE_SET || rtt <= SCALE_LO ) return 0
+	if ( rtt >= SCALE_HI ) return 1
+	return (log(rtt) - SCALE_L0) / SCALE_SPAN
+}
+
+# Bar height, from 1 up to top (8 eighths per line of the bar).
+function level(rtt, top) {
+	return 1 + int(pos(rtt) * (top - 1) + 0.5)
+}
+
+############################################################
+# Packets
+#
+# Every packet ends up either received (ST[seq] = "R") or lost ("L"),
+# exactly once, in sequence order. A reply for a packet already counted as
+# lost turns it into a late reply; a second reply for a received packet is a
+# duplicate and is not counted again.
+
+# Maps the 16-bit icmp_seq to a counter that keeps growing after it wraps.
+function unwrap(raw,   s) {
+	s = raw + SEQ_BASE
+	if ( HAVE_SEQ ) {
+		if ( s < LAST_SEQ - 32768 ) {
+			SEQ_BASE += 65536
+			s += 65536
+		} else if ( s > LAST_SEQ + 32768 && SEQ_BASE >= 65536 ) {
+			s -= 65536
+		}
+	}
+	return s
+}
+
+# The first packet, either from the ping header style or the first event.
+function start_seq(s) {
+	if ( HAVE_SEQ ) return
+	HAVE_SEQ = 1
+	if ( FIRST_SEQ >= 0 && s >= FIRST_SEQ && s - FIRST_SEQ < 100000 ) {
+		LAST_SEQ = FIRST_SEQ - 1
+	} else {
+		LAST_SEQ = s - 1
+	}
+	FIRST = LAST_SEQ + 1
+}
+
+# Every packet from LAST_SEQ+1 up to (and including) s is lost.
+function lose_until(s) {
+	while ( LAST_SEQ < s ) {
+		LAST_SEQ++
+		packet_lost(LAST_SEQ)
+	}
+}
+
+function on_reply(raw, rtt, is_dup,   s) {
+	banner()
+	s = unwrap(raw)
+	start_seq(s)
+	if ( is_dup || (s <= LAST_SEQ && ST[s] == "R") ) {
+		dups++
+		DIRTY = 1
+		return
+	}
+	if ( s <= LAST_SEQ ) {
+		if ( ST[s] == "L" ) late_reply(s, rtt)
+		return
+	}
+	lose_until(s - 1)
+	LAST_SEQ = s
+	packet_ok(s, rtt)
+}
+
+# "Request timeout for icmp_seq N" (BSD), "no answer yet for icmp_seq=N"
+# (iputils with -O).
+function on_timeout(raw,   s) {
+	banner()
+	s = unwrap(raw)
+	start_seq(s)
+	if ( s > LAST_SEQ ) lose_until(s)
+}
+
+function packet_ok(s, rtt) {
+	msg_streak_end()
+	ST[s] = "R"
+	reply_stats(rtt)
+	ring_put(s, rtt)
+	arrival_put(s, rtt)
+	timeline_add(rtt)
+	consecutive_lost = 0
+	LAST_EVENT_LOST = 0
+	LAST_REPLY_T = NOW
+	REPLY_TICK = TICKS
+	draw_cell(s, rtt)
+	prune()
+}
+
+function packet_lost(s) {
+	ST[s] = "L"
+	lost++
+	consecutive_lost++
+	LAST_EVENT_LOST = 1
+	ring_put(s, -1)
+	timeline_add(-1)
+	draw_cell(s, -1)
+}
+
+function late_reply(s, rtt,   i, b) {
+	ST[s] = "R"
+	lost--
+	late++
+	reply_stats(rtt)
+	arrival_put(s, rtt)
+	DIRTY = 1
+	consecutive_lost = 0
+	LAST_REPLY_T = NOW
+	REPLY_TICK = TICKS
+	if ( LAST_N > 0 ) {
+		i = s % LAST_N
+		if ( RING_S[i] == s ) RING_V[i] = rtt
+	}
+	b = int((s - FIRST) / TL_SPAN)
+	if ( b >= 0 && b <= TL_I ) {
+		TL_L[b]--
+		TL_N[b]++
+		TL_SUM[b] += rtt
+	}
+	if ( (s in CB) && CB[s] == BAND_ID ) {
+		band_lost--
+		band_n++
+		band_sum += rtt
+		repaint_cell(s, rtt)
+	}
+}
+
+# Forgets packets too old to receive a late reply.
+function prune(   k) {
+	if ( LAST_SEQ - PRUNED < 8192 ) return
+	PRUNED = LAST_SEQ - 4096
+	for ( k in ST ) if ( k + 0 < PRUNED ) delete ST[k]
+	for ( k in CB ) if ( k + 0 < PRUNED ) {
+		delete CB[k]
+		delete CC[k]
+	}
+}
+
+############################################################
+# Statistics
+
+function reply_stats(rtt,   k, d, m, idx) {
+	if ( received == 0 || rtt < min_rtt ) min_rtt = rtt
+	if ( received == 0 || rtt > max_rtt ) max_rtt = rtt
+	if ( received > 0 ) {
+		jit_sum += abs(rtt - last_rtt)
+		jit_n++
+	}
+	received++
+	sum_rtt += rtt
+	last_rtt = rtt
+
+	# Fine histogram, 2% wide buckets, for the percentiles.
+	k = (rtt > 0.001) ? int(log(rtt / 0.001) / LOG_FH) : 0
+	FH[k]++
+	if ( FH[k] == 1 || rtt < FH_MINV[k] ) FH_MINV[k] = rtt
+	if ( FH[k] == 1 || rtt > FH_MAXV[k] ) FH_MAXV[k] = rtt
+	if ( received == 1 || k < FH_LO ) FH_LO = k
+	if ( received == 1 || k > FH_HI ) FH_HI = k
+
+	# Coarse histogram, 1-2-5 buckets, for the summary.
+	if ( rtt < 0.01 ) rtt = 0.01
+	d = floor_log10(rtt)
+	m = rtt / 10 ^ d
+	idx = 3 * d + ((m < 2) ? 0 : (m < 5) ? 1 : 2)
+	H125[idx]++
+	if ( received == 1 || idx < H125_LO ) H125_LO = idx
+	if ( received == 1 || idx > H125_HI ) H125_HI = idx
+
+	if ( !SCALE_SET ) scale_auto(rtt)
+}
+
+# Lower bound of a 1-2-5 bucket.
+function h125_lo(idx,   d, r) {
+	d = idx - 3 * int(idx / 3)
+	if ( d < 0 ) d += 3
+	r = (d == 0) ? 1 : (d == 1) ? 2 : 5
+	return r * 10 ^ ((idx - d) / 3)
+}
+
+# Session percentile (q in 0..1), from the fine histogram.
+function percentile(q,   k, need, acc, v) {
+	if ( received == 0 ) return 0
+	need = q * received
+	acc = 0
+	for ( k = FH_LO ; k <= FH_HI ; k++ ) {
+		acc += FH[k]
+		if ( acc >= need ) break
+	}
+	# The middle of the bucket, but never outside the values that fell in it:
+	# a bucket holding a single value gives that value exactly.
+	v = 0.001 * exp((k + 0.5) * LOG_FH)
+	if ( k in FH_MINV ) {
+		if ( v < FH_MINV[k] ) v = FH_MINV[k]
+		if ( v > FH_MAXV[k] ) v = FH_MAXV[k]
+	}
+	return v
+}
+
+function loss_pct() {
+	return (received + lost > 0) ? lost * 100 / (received + lost) : 0
+}
+
+function avg_rtt() {
+	return (received > 0) ? sum_rtt / received : 0
+}
+
+function jitter() {
+	return (jit_n > 0) ? jit_sum / jit_n : 0
+}
+
+# Mean opinion score (1 to 4.4) for a voice call over this path, from the
+# simplified ITU-T E-model.
+function mos(avg, jit, lossp,   eff, r) {
+	eff = avg + 2 * jit + 10
+	r = (eff < 160) ? 93.2 - eff / 40 : 93.2 - (eff - 120) / 10
+	r -= 2.5 * lossp
+	if ( r < 0 ) r = 0
+	if ( r > 100 ) r = 100
+	# Rounded as it is shown, so that the word always matches the number.
+	return int((1 + 0.035 * r + 0.000007 * r * (r - 60) * (100 - r)) * 100 + 0.5) / 100
+}
+
+# How many of the five segments of the meter are lit, one step per word.
+function mos_segs(m) {
+	return (m >= 4.3) ? 5 : (m >= 4.0) ? 4 : (m >= 3.6) ? 3 : (m >= 3.1) ? 2 : 1
+}
+
+function mos_word(m) {
+	if ( m >= 4.3 ) return "excellent"
+	if ( m >= 4.0 ) return "good"
+	if ( m >= 3.6 ) return "fair"
+	if ( m >= 3.1 ) return "poor"
+	return "bad"
+}
+
+function mos_color(m) {
+	if ( m >= 4.0 ) return C_OK
+	if ( m >= 3.6 ) return C_WARN
+	return C_BAD
+}
+
+# The last LAST_N packets, indexed by seq.
+function ring_put(s, v,   i) {
+	if ( LAST_N <= 0 ) return
+	i = s % LAST_N
+	RING_V[i] = v
+	RING_S[i] = s
+}
+
+# The replies in the order they arrived, for the jitter of the last LAST_N
+# packets: a late reply is compared with the one that came just before it,
+# as in the session jitter.
+function arrival_put(s, v,   j) {
+	if ( LAST_N <= 0 ) return
+	j = ARR_N % (2 * LAST_N)
+	ARR_S[j] = s
+	ARR_V[j] = v
+	ARR_N++
+}
+
+# Statistics of the last LAST_N packets, into R_N (packets), R_LOST, R_MIN,
+# R_AVG, R_MAX, R_P95 and R_JIT.
+function recent_stats(   s, i, v, n, prev, have_prev, sorted, sum, jsum, jn, a) {
+	R_N = R_LOST = R_MIN = R_AVG = R_MAX = R_P95 = R_JIT = 0
+	if ( LAST_N <= 0 || !HAVE_SEQ ) return
+	n = sum = jsum = jn = have_prev = 0
+	for ( s = LAST_SEQ - LAST_N + 1 ; s <= LAST_SEQ ; s++ ) {
+		if ( s < FIRST ) continue
+		i = s % LAST_N
+		if ( RING_S[i] != s ) continue
+		R_N++
+		v = RING_V[i]
+		if ( v < 0 ) {
+			R_LOST++
+			continue
+		}
+		n++
+		sorted[n] = v
+		sum += v
+		if ( n == 1 || v < R_MIN ) R_MIN = v
+		if ( n == 1 || v > R_MAX ) R_MAX = v
+	}
+	R_REPLIES = n
+	for ( a = (ARR_N > 2 * LAST_N) ? ARR_N - 2 * LAST_N : 0 ; a < ARR_N ; a++ ) {
+		i = a % (2 * LAST_N)
+		s = ARR_S[i]
+		if ( s <= LAST_SEQ - LAST_N || s < FIRST || RING_S[s % LAST_N] != s ) continue
+		v = ARR_V[i]
+		if ( have_prev ) {
+			jsum += abs(v - prev)
+			jn++
+		}
+		prev = v
+		have_prev = 1
+	}
+	if ( n > 0 ) {
+		R_AVG = sum / n
+		sort_n(sorted, n)
+		i = int(0.95 * n + 0.999)
+		if ( i < 1 ) i = 1
+		R_P95 = sorted[i]
+	}
+	if ( jn > 0 ) R_JIT = jsum / jn
+}
+
+# The whole session, kept in at most TL_CAP bins for the summary: when they
+# fill up, neighbors are merged and each bin covers twice as many packets.
+function timeline_add(v,   j) {
+	if ( v >= 0 ) {
+		TL_N[TL_I]++
+		TL_SUM[TL_I] += v
+	} else {
+		TL_L[TL_I]++
+	}
+	if ( ++TL_C < TL_SPAN ) return
+	TL_C = 0
+	if ( ++TL_I < TL_CAP ) return
+	for ( j = 0 ; j < TL_CAP / 2 ; j++ ) {
+		TL_N[j]   = TL_N[2 * j]   + TL_N[2 * j + 1]
+		TL_SUM[j] = TL_SUM[2 * j] + TL_SUM[2 * j + 1]
+		TL_L[j]   = TL_L[2 * j]   + TL_L[2 * j + 1]
+	}
+	for ( j = TL_CAP / 2 ; j < TL_CAP ; j++ ) TL_N[j] = TL_SUM[j] = TL_L[j] = 0
+	TL_I = TL_CAP / 2
+	TL_SPAN *= 2
+}
+############################################################
+# Output. Everything caused by one input line is collected in OUT and
+# written at once, so the terminal never shows half of a redraw.
+
+function flush() {
+	if ( OUT != "" ) {
+		# Terminals that know DEC mode 2026 show the update all at once,
+		# never half drawn; the others ignore it.
+		if ( IS_TERMINAL ) OUT = CSI "?2026h" OUT CSI "?2026l"
+		printf("%s", OUT)
+		OUT = ""
+	}
+	fflush()
+}
+
+# Moves the cursor to column x (counted from 0) of its line.
+function go_col(x) {
+	return "\r" ((x > 0) ? CSI x "C" : "")
+}
+
+# Splits s into display cells (a UTF-8 character each) in arr[1..n].
+function cells_of(s, arr,   i, n, ch) {
+	n = 0
+	for ( i = 1 ; i <= length(s) ; i++ ) {
+		ch = substr(s, i, 1)
+		if ( n > 0 && ch ~ /^[\200-\277]$/ ) {
+			arr[n] = arr[n] ch
+		} else {
+			arr[++n] = ch
+		}
+	}
+	return n
+}
+
+############################################################
+# The banner, printed once when ping says what it is pinging.
+
+function on_header(line,   s, a, n, name, ip) {
+	if ( HEADER_PARSED ) {
+		message(line)
+		return
+	}
+	HEADER_PARSED = 1
+	name = ip = ""
+	if ( line ~ /^PING6\(/ ) {
+		# macOS ping6: PING6(56=40+8+8 bytes) 2001:db8::1 --> 2606:4700::1111
+		n = split(line, a, " ")
+		name = a[n]
+		if ( match(line, /\([0-9]+=/) ) BYTES = substr(line, RSTART + 1, RLENGTH - 2)
+		FIRST_SEQ = 0
+	} else {
+		# PING one.one.one.one (1.1.1.1): 56 data bytes
+		# PING 1.1.1.1 (1.1.1.1) 56(84) bytes of data.
+		s = substr(line, 6)
+		name = s
+		sub(/[ (].*/, "", name)
+		if ( match(s, /\([^)]*\)/) ) ip = substr(s, RSTART + 1, RLENGTH - 2)
+		if ( ip !~ /^[0-9A-Fa-f.:]+$/ || ip == name ) ip = ""
+		if ( match(line, /[0-9]+(\([0-9]+\))? (data )?bytes/) ) {
+			BYTES = substr(line, RSTART, RLENGTH)
+			sub(/[^0-9].*/, "", BYTES)
+		}
+		# iputils counts packets from 1; BSD, macOS and busybox from 0. Their
+		# headers all say "(address): 56 data bytes" or "from source: 56 data
+		# bytes"; iputils says "56(84) bytes of data", or for IPv6, "(address)
+		# 56 data bytes".
+		FIRST_SEQ = (line ~ /bytes of data/ || (line ~ /data bytes/ && line !~ /(\)|from [^ ]+): [0-9]+ data bytes/)) ? 1 : 0
+	}
+	TARGET_NAME = sanitize(name)
+	TARGET_IP = sanitize(ip)
+	banner()
+	DIRTY = 1
+}
+
+function banner(   left, right, bw, t, n, i, f, c, last, out, b0, b1) {
+	if ( BANNER_DONE ) return
+	BANNER_DONE = 1
+	if ( TARGET_NAME == "" ) TARGET_NAME = sanitize(TARGET)
+	if ( TARGET_NAME == "" ) TARGET_NAME = "?"
+
+	bw = IS_TERMINAL ? W : greater(COLUMNS - 1, 60)
+	left = " " G_DIAMOND " " MYNAME "  "
+	b0 = vis(left) + 1
+	left = left TARGET_NAME
+	b1 = vis(left)
+	if ( TARGET_IP != "" ) left = left "  " TARGET_IP
+	right = ((BYTES != "") ? BYTES " bytes " G_SEP " " : "") \
+		"every " fmt_num(INTERVAL) " s " G_SEP " " clock(NOW) " "
+	if ( vis(left) + vis(right) + 2 > bw ) right = clock(NOW) " "
+	if ( vis(left) + vis(right) + 2 > bw ) right = ""
+	t = left rep(" ", bw - vis(left) - vis(right)) right
+	n = cells_of(t, BANCELL)
+	if ( n > bw ) n = bw
+
+	out = ""
+	if ( USE_COLOR && DEPTH != 16 ) {
+		# A gradient from violet to teal under white text. The 256-color
+		# palette is too coarse for a smooth one, so it gets three steps.
+		out = rgb(245, 243, 255, 0)
+		last = ""
+		for ( i = 1 ; i <= n ; i++ ) {
+			f = (n > 1) ? (i - 1) / (n - 1) : 0
+			if ( DEPTH == 24 ) {
+				c = rgb(109 - 95 * f, 40 + 76 * f, 217 - 73 * f, 1)
+			} else {
+				c = CSI "48;5;" ((f < 0.34) ? 56 : (f < 0.67) ? 62 : 31) "m"
+			}
+			if ( c != last && (DEPTH == 24 || last == "" || BANCELL[i] == " ") ) {
+				out = out c
+				last = c
+			}
+			if ( i == b0 ) out = out BOLD
+			out = out BANCELL[i]
+			if ( i == b1 ) out = out CSI "22m"
+		}
+	} else {
+		# Reverse video reads well whatever the palette.
+		if ( USE_COLOR ) out = CSI "7m"
+		for ( i = 1 ; i <= n ; i++ ) {
+			if ( USE_COLOR && i == b0 ) out = out BOLD
+			out = out BANCELL[i]
+			if ( USE_COLOR && i == b1 ) out = out CSI "22m"
+		}
+	}
+
+	if ( IS_TERMINAL && ANCHOR != "none" ) {
+		band_end()
+		OUT = OUT RST "\r" CSI "J"
+	}
+	OUT = OUT out RST "\n"
+	FOOT_VALID = 0
+	if ( IS_TERMINAL ) ANCHOR = "fresh"
+	DIRTY = 1
+}
+
+############################################################
+# The graph: rows ("bands") with one bar per packet, the time and seq at the
+# left, and the band average and loss at the right. A band is two lines tall,
+# with 16 bar heights, or one line in compact mode, with 8.
+#
+# While a band is open (ANCHOR == "band"), the cursor waits on its bottom line
+# where the next bar goes, and the status panel sits right below. Between
+# bands (ANCHOR == "fresh"), the cursor is at the start of the line where the
+# panel begins.
+
+function band_layout() {
+	TALL = (USE_UNICODE && !USE_COMPACT && LINES >= 16)
+	GUT = (W >= 50) ? 10 : 0
+	MARG = (W >= 64) ? (TALL ? 12 : 17) : 0
+	CAP = W - GUT - MARG
+	if ( CAP < 10 ) {
+		GUT = MARG = 0
+		CAP = W
+	}
+	if ( CAP < 1 ) CAP = 1
+}
+
+function band_start(s) {
+	band_layout()
+	BAND_ID++
+	BAND_COL = 0
+	band_n = band_sum = band_lost = 0
+	FOOT_VALID = 0
+	OUT = OUT RST "\r" CSI "J"
+	if ( GUT ) OUT = OUT C_LABEL clock(NOW) RST " " C_FRAME G_AXIS RST
+	if ( TALL ) {
+		OUT = OUT "\n"
+		if ( GUT ) OUT = OUT C_DIM lpad("#" (s % 10000000), 8) RST " " C_FRAME G_AXIS RST
+	}
+	ANCHOR = "band"
+}
+
+function band_end() {
+	if ( ANCHOR != "band" ) return
+	OUT = OUT RST "\n"
+	FOOT_VALID = 0
+	ANCHOR = "fresh"
+}
+
+function draw_cell(s, rtt) {
+	if ( !IS_TERMINAL ) {
+		plain_cell(s, rtt)
+		return
+	}
+	if ( WINCH_PENDING ) winch_apply()
+	if ( ANCHOR == "band" && BAND_COL >= CAP ) band_end()
+	if ( ANCHOR != "band" ) band_start(s)
+	CB[s] = BAND_ID
+	CC[s] = BAND_COL
+	if ( rtt < 0 ) {
+		band_lost++
+	} else {
+		band_n++
+		band_sum += rtt
+	}
+	OUT = OUT cell(rtt)
+	BAND_COL++
+	DIRTY = 1
+}
+
+# The escape codes that paint one bar at the cursor (on the bottom line of
+# the band) and leave the cursor right after it.
+function cell(rtt,   L, c) {
+	if ( rtt < 0 ) {
+		if ( TALL ) return C_LOSTBG CSI "A" " " CSI "B\b" RST C_LOST G_LOST RST
+		return C_LOST G_LOST RST
+	}
+	c = bar_color(rtt, TALL)
+	if ( TALL ) {
+		L = level(rtt, 16)
+		if ( L > 8 ) return c CSI "A" BLK[L - 8] CSI "B\b" BLK[8] RST
+		return c CSI "A" " " CSI "B\b" BLK[L] RST
+	}
+	return c BLK[level(rtt, 8)] RST
+}
+
+# The color of a bar. Below 24-bit color, bars of the same height get the
+# same color, rather than flickering between neighbors of the palette.
+function bar_color(rtt, tall) {
+	if ( DEPTH == 24 ) return heat(pos(rtt))
+	if ( tall ) return heat((level(rtt, 16) - 1) / 15)
+	return heat((level(rtt, 8) - 1) / 7)
+}
+
+# A late reply turns its cross into a bar, if it is still in the open band.
+function repaint_cell(s, rtt) {
+	if ( !IS_TERMINAL || ANCHOR != "band" ) return
+	OUT = OUT go_col(GUT + CC[s]) cell(rtt) go_col(GUT + BAND_COL)
+	DIRTY = 1
+}
+
+function margin_update(   x, n, p, top, bot) {
+	if ( !MARG || ANCHOR != "band" ) return
+	n = band_n + band_lost
+	p = (n > 0) ? band_lost * 100 / n : 0
+	top = (band_n > 0) ? heat(pos(band_sum / band_n)) lpad(fmt3(band_sum / band_n), 8) RST C_LABEL " ms" RST : rep(" ", 11)
+	bot = loss_color(p) lpad(fmt_pct(p), 6) RST C_LABEL " lost" RST
+	x = GUT + CAP + 1
+	if ( TALL ) {
+		OUT = OUT go_col(x) CSI "A" top CSI "B" go_col(x) bot
+	} else {
+		top = (band_n > 0) ? heat(pos(band_sum / band_n)) lpad(fmt3(band_sum / band_n), 5) RST C_LABEL " ms " RST : rep(" ", 9)
+		OUT = OUT go_col(x) top loss_color(p) lpad(fmt_pct(p), 7) RST
+	}
+	OUT = OUT go_col(GUT + BAND_COL)
+}
+
+function loss_color(p) {
+	if ( p <= 0 ) return C_DIM
+	if ( p < 5 ) return C_WARN
+	return C_BAD
+}
+
+############################################################
+# Other lines (errors and warnings from ping) are printed between bands, with
+# their time. A message that repeats while no reply comes back is printed
+# once, and counted in the status panel.
+
+function message(line,   norm) {
+	line = sanitize(line)
+	norm = line
+	sub(/^\[[0-9.]+\] /, "", norm)
+	gsub(/icmp_seq[= ][0-9]+ ?/, "", norm)
+	if ( MSG_STREAK && norm == MSG_LAST ) {
+		MSG_TIMES++
+		DIRTY = 1
+		return
+	}
+	msg_streak_end()
+	MSG_LAST = norm
+	MSG_TEXT = line
+	MSG_TIMES = 1
+	MSG_STREAK = 1
+	if ( !IS_TERMINAL ) {
+		plain_row_end()
+		OUT = OUT C_LABEL clock(NOW) RST "  " msg_color(line) line RST "\n"
+		return
+	}
+	if ( WINCH_PENDING ) winch_apply()
+	band_end()
+	OUT = OUT RST "\r" CSI "J" ((W >= 12) ? C_LABEL clock(NOW) RST "  " : "") msg_color(line) G_WARN " " cut(line, W - ((W >= 12) ? 12 : 2)) RST "\n"
+	if ( ANCHOR != "none" ) ANCHOR = "fresh"
+	FOOT_VALID = 0
+	DIRTY = 1
+}
+
+function msg_color(line) {
+	if ( line ~ /nreachable|[Nn]etwork is down|[Nn]o route|[Uu]nknown host|annot resolve|[Ff]ailure|[Ee]rror|[Ee]xceeded/ ) return C_BAD
+	return C_WARN
+}
+
+function msg_streak_end() {
+	if ( !MSG_STREAK ) return
+	MSG_STREAK = 0
+	if ( !IS_TERMINAL && MSG_TIMES >= 2 ) {
+		plain_row_end()
+		OUT = OUT C_LABEL clock(NOW) RST "  " C_DIM "Last message repeated " MSG_TIMES " times." RST "\n"
+	}
+	DIRTY = 1
+}
+
+############################################################
+# When the output is not a terminal, rows of bars are printed whole, every
+# LAST_N packets, each followed by the statistics.
+
+function plain_cell(s, rtt) {
+	if ( PROW && LAST_N > 0 && PROW_N >= LAST_N ) plain_row_end()
+	if ( !PROW ) {
+		if ( USE_LEGEND && SCALE_SET && !PLAIN_LEGEND ) {
+			PLAIN_LEGEND = 1
+			legend_line()
+			OUT = OUT rep(" ", 9) LS "\n"
+		}
+		PROW = 1
+		PROW_N = 0
+		BAND_ID++
+		band_n = band_sum = band_lost = 0
+		OUT = OUT C_LABEL clock(NOW) RST " "
+	}
+	CB[s] = BAND_ID
+	CC[s] = PROW_N
+	if ( rtt < 0 ) {
+		band_lost++
+	} else {
+		band_n++
+		band_sum += rtt
+	}
+	OUT = OUT cell(rtt)
+	PROW_N++
+	if ( LAST_N > 0 && PROW_N >= LAST_N ) plain_row_end()
+}
+
+function plain_row_end(   n, p) {
+	if ( !PROW ) return
+	PROW = 0
+	n = band_n + band_lost
+	p = (n > 0) ? band_lost * 100 / n : 0
+	if ( !(USE_RECENTSTATS && LAST_N > 0 && n == LAST_N) ) {
+		OUT = OUT "  " ((band_n > 0) ? heat(pos(band_sum / band_n)) fmt3(band_sum / band_n) RST C_LABEL " ms" RST : C_LABEL "-" RST) \
+			C_LABEL ", " RST loss_color(p) fmt_pct(p) RST C_LABEL " lost" RST
+	}
+	OUT = OUT "\n"
+	if ( USE_GLOBALSTATS ) {
+		session_row(1000)
+		OUT = OUT "  " LS "\n"
+	}
+	if ( USE_RECENTSTATS && LAST_N > 0 ) {
+		recent_row(1000)
+		OUT = OUT "  " LS "\n"
+	}
+}
+
+############################################################
+# Terminal title and size
+
+# The latency (or that it is missing) comes first, as tabs cut titles short.
+function title_update(   t, st) {
+	if ( !IS_TERMINAL || !USE_TITLE ) return
+	st = status_state()
+	if ( received + lost == 0 ) {
+		t = MYNAME " " TARGET_NAME
+	} else {
+		if ( st == "down" ) {
+			t = (consecutive_lost >= 3) ? consecutive_lost " lost in a row" : "no reply " fmt_dur(NOW - ((received > 0) ? LAST_REPLY_T : START_T))
+		} else if ( st == "wait" ) {
+			t = "waiting " fmt_dur(NOW - ((received > 0) ? LAST_REPLY_T : START_T))
+		} else {
+			t = fmt3(last_rtt) " ms"
+		}
+		t = t " " G_SEP " " TARGET_NAME
+		if ( lost > 0 ) t = t " " G_SEP " " fmt_pct(loss_pct()) " lost"
+	}
+	if ( t == TITLE_LAST ) return
+	TITLE_LAST = t
+	OUT = OUT ESC "]2;" t BEL
+}
+
+# Resizing sends a burst of signals, so the work waits for a quiet moment.
+function on_winch() {
+	WINCH_PENDING = 1
+	WINCH_TICK = TICKS
+}
+
+function winch_apply(   oc, ol) {
+	WINCH_PENDING = 0
+	oc = COLUMNS
+	ol = LINES
+	get_terminal_size()
+	if ( COLUMNS == oc && LINES == ol ) return
+	if ( ANCHOR == "band" && COLUMNS < oc ) {
+		# The terminal may have rewrapped the open band: continue below it.
+		OUT = OUT RST CSI "J" "\n"
+		ANCHOR = "fresh"
+	}
+	FOOT_VALID = 0
+	DIRTY = 1
+}
+
+# Back from ^Z: the shell has printed below the graph, so carry on from where
+# the cursor is now.
+function on_cont() {
+	if ( ANCHOR == "band" ) {
+		ANCHOR = "fresh"
+		# Late replies must not repaint a band that is no longer there.
+		BAND_ID++
+	}
+	if ( ANCHOR != "none" ) OUT = OUT RST "\r" CSI "J"
+	OUT = OUT CSI "?25l"
+	if ( USE_TITLE ) {
+		OUT = OUT CSI "22;2t"
+		TITLE_LAST = ""
+	}
+	FOOT_VALID = 0
+	DIRTY = 1
+}
+############################################################
+# The status panel, kept below the graph.
+#
+# The full panel, on terminals at least 65 columns wide and 14 lines tall:
+#
+#   ╭─ ● live ─ one.one.one.one  1.1.1.1 ─────────── 14:06:23 · up 4m12s ─╮
+#   │      ╺┓ ╺━┓   ╻ ╻ ms │ session  min  9.81  avg  12.1  loss  0.40%  │
+#   │       ┃ ┏━┛   ┗━┫    │ last 60  min  9.81  avg  11.9  loss     0%  │
+#   │      ╺┻╸┗━╸ •   ╹    │ MOS 4.39 ▰▰▰▰▰ excellent   250 sent  1 lost │
+#   ╰─ ▁▂▃▄▅▆▇█ 5 ms → 200 ms   ✕ lost ─────────────────────── prettyping ─╯
+#
+# Otherwise a slim panel: a status line, then the statistics lines.
+
+function footer_tier() {
+	if ( !IS_TERMINAL || LINES < 6 || W < 30 ) return 0
+	if ( USE_UNICODE && W >= 64 && LINES >= 14 ) return 2
+	return 1
+}
+
+# live, wait (late or losing replies), down (nothing for long), or start.
+function status_state(   age) {
+	if ( received + lost == 0 ) return (NOW - START_T > STALL) ? "wait" : "start"
+	if ( consecutive_lost >= 3 ) return "down"
+	age = NOW - ((received > 0) ? LAST_REPLY_T : START_T)
+	if ( age > 3 * STALL ) return "down"
+	if ( age > STALL || LAST_EVENT_LOST ) return "wait"
+	return "live"
+}
+
+function status_chip(   age, d) {
+	age = fmt_dur(NOW - ((received > 0) ? LAST_REPLY_T : START_T))
+	if ( STATE == "live" ) {
+		# The dot glows on each reply and fades over the next ticks.
+		d = TICKS - REPLY_TICK
+		la(G_DOT, (d <= 0) ? C_OK_HI : (d == 1) ? C_OK_MID : C_OK)
+		la(" live", C_OK)
+	} else if ( STATE == "start" ) {
+		la(SPIN[1 + TICKS % SPIN_N] " starting", C_LABEL)
+	} else if ( STATE == "wait" ) {
+		la(SPIN[1 + TICKS % SPIN_N] " waiting " age, C_WARN)
+	} else if ( consecutive_lost >= 3 ) {
+		la(G_LOST " " consecutive_lost " lost in a row", C_BAD)
+	} else {
+		la(G_LOST " no reply " age, C_BAD)
+	}
+}
+
+function footer_top(   chip, chipw, host, ip, right, rc, f) {
+	lb()
+	status_chip()
+	chip = LS
+	chipw = LW
+	if ( MSG_STREAK ) {
+		right = G_WARN " " cut(MSG_TEXT, int(W / 2)) ((MSG_TIMES > 1) ? " " G_TIMES MSG_TIMES : "")
+		rc = msg_color(MSG_TEXT)
+	} else {
+		right = clock(NOW) " " G_SEP " up " fmt_dur(NOW - START_T)
+		rc = C_LABEL
+	}
+	host = TARGET_NAME
+	ip = (TARGET_IP != "") ? "  " TARGET_IP : ""
+
+	# The corners, rules and spaces take 11 columns.
+	f = W - 11 - chipw - vis(host) - vis(ip) - vis(right)
+	if ( f < 1 && ip != "" ) {
+		f += vis(ip)
+		ip = ""
+	}
+	if ( f < 1 && !MSG_STREAK ) {
+		f += vis(right)
+		right = clock(NOW)
+		f -= vis(right)
+	}
+	if ( f < 1 ) {
+		f += vis(right) + 1
+		right = ""
+	}
+	if ( f < 1 ) {
+		host = cut(host, vis(host) + f - 1)
+		f = 1
+	}
+
+	lb()
+	la(G_TL G_H " ", C_FRAME)
+	lraw(chip, chipw)
+	la(" " G_H " ", C_FRAME)
+	la(host, BOLD)
+	la(ip, C_LABEL)
+	la(" ", "")
+	la(rep(G_H, f), C_FRAME)
+	if ( right != "" ) {
+		la(" ", "")
+		la(right, rc)
+		la(" " G_H G_TR, C_FRAME)
+	} else {
+		la(G_H G_H G_TR, C_FRAME)
+	}
+	return LS
+}
+
+# The key to the bars, into LS and LW.
+function legend_line(   i) {
+	lb()
+	for ( i = 1 ; i <= 8 ; i++ ) la(BLK[i], heat((i - 1) / 7))
+	if ( SCALE_SET ) {
+		la(" " fmt_ms(SCALE_LO) " " G_ARROW " " fmt_ms(SCALE_HI), C_LABEL)
+	} else {
+		la(" scale set by the first reply", C_LABEL)
+	}
+	la("   ", "")
+	la(G_LOST, C_LOST)
+	la(" lost", C_LABEL)
+}
+
+function footer_bottom(   leg, legw, label, f) {
+	leg = ""
+	legw = 0
+	if ( USE_LEGEND ) {
+		legend_line()
+		leg = LS
+		legw = LW
+	}
+	label = MYNAME
+
+	# The corners, rules and spaces take 8 columns.
+	f = W - 8 - legw - vis(label)
+	if ( f < 1 ) {
+		f += vis(label) + 1
+		label = ""
+	}
+	if ( f < 1 ) {
+		f += legw + 1
+		leg = ""
+		legw = 0
+	}
+
+	lb()
+	la(G_BL G_H, C_FRAME)
+	if ( legw > 0 ) {
+		la(" ", "")
+		lraw(leg, legw)
+	}
+	la(" " rep(G_H, f), C_FRAME)
+	if ( label != "" ) {
+		la(" ", "")
+		la(label, C_DIM)
+		la(" " G_H G_BR, C_FRAME)
+	} else {
+		la(G_H G_H G_BR, C_FRAME)
+	}
+	return LS
+}
+
+# A row of statistics: the label, then as many fields as fit in w columns,
+# picked by importance but shown in the usual order. The values are in SV.
+function stats_row(label, w,   i, k, used) {
+	used = LABW
+	for ( i = 1 ; i <= 6 ; i++ ) {
+		k = SPRIO[i]
+		SINC[k] = (used + 2 + SFW[k] <= w)
+		if ( SINC[k] ) used += 2 + SFW[k]
+	}
+	lb()
+	la(rpad(label, LABW), C_LABEL)
+	for ( i = 1 ; i <= 6 ; i++ ) {
+		k = SORDER[i]
+		if ( !SINC[k] ) continue
+		la("  ", "")
+		if ( k == "loss" ) {
+			la("loss ", C_LABEL)
+			la(lpad(fmt_pct(SV[k]), 6), loss_color(SV[k]))
+		} else {
+			la(k " ", C_LABEL)
+			la(lpad((SV["n"] > 0) ? fmt3(SV[k]) : "-", 5), (k == "avg") ? BOLD : "")
+		}
+	}
+}
+
+function session_row(w) {
+	SV["n"] = received
+	SV["min"] = min_rtt
+	SV["avg"] = avg_rtt()
+	SV["p95"] = percentile(0.95)
+	SV["max"] = max_rtt
+	SV["jit"] = jitter()
+	SV["loss"] = loss_pct()
+	stats_row("session", w)
+}
+
+function recent_row(w) {
+	recent_stats()
+	SV["n"] = R_REPLIES
+	SV["min"] = R_MIN
+	SV["avg"] = R_AVG
+	SV["p95"] = R_P95
+	SV["max"] = R_MAX
+	SV["jit"] = R_JIT
+	SV["loss"] = (R_N > 0) ? R_LOST * 100 / R_N : 0
+	stats_row("last " LAST_N, w)
+}
+
+# Call quality and the packet counts.
+function quality_row(w,   m, on, i, c, f, nf) {
+	lb()
+	if ( LAST_N > 0 && USE_RECENTSTATS ) {
+		recent_stats()
+		m = mos(R_AVG, R_JIT, (R_N > 0) ? R_LOST * 100 / R_N : 0)
+		if ( R_REPLIES == 0 ) m = 1
+	} else {
+		m = mos(avg_rtt(), jitter(), loss_pct())
+		if ( received == 0 ) m = 1
+	}
+	la("MOS ", C_LABEL)
+	if ( received + lost == 0 ) {
+		la("   -", C_DIM)
+		la(" " rep(G_MOS_OFF, 5) rep(" ", 10), C_FRAME)
+	} else {
+		# Without fresh replies, the verdict is greyed out like the digits.
+		c = (STATE == "live") ? mos_color(m) : C_DIM
+		la(sprintf("%.2f", m), c)
+		la(" ", "")
+		on = mos_segs(m)
+		for ( i = 1 ; i <= 5 ; i++ ) la((i <= on) ? G_MOS_ON : G_MOS_OFF, (i <= on) ? c : C_FRAME)
+		# Padded, so the counts after it stay put when the word changes.
+		la(rpad(" " mos_word(m), 10), c)
+	}
+
+	nf = 0
+	F_TXT[++nf] = (received + lost) ""
+	F_LAB[nf] = " sent"
+	F_COL[nf] = ""
+	if ( lost > 0 ) {
+		F_TXT[++nf] = lost ""
+		F_LAB[nf] = " lost"
+		F_COL[nf] = C_BAD
+	}
+	if ( dups > 0 ) {
+		F_TXT[++nf] = dups ""
+		F_LAB[nf] = " dup"
+		F_COL[nf] = C_WARN
+	}
+	if ( late > 0 ) {
+		F_TXT[++nf] = late ""
+		F_LAB[nf] = " late"
+		F_COL[nf] = C_WARN
+	}
+	for ( f = 1 ; f <= nf ; f++ ) {
+		if ( LW + ((f == 1) ? 3 : 2) + vis(F_TXT[f] F_LAB[f]) > w ) break
+		la((f == 1) ? "   " : "  ", "")
+		la(F_TXT[f], F_COL[f])
+		la(F_LAB[f], C_LABEL)
+	}
+}
+
+# The latest reply, in big digits.
+function footer_big(   v, unit) {
+	unit = "ms"
+	if ( received == 0 ) {
+		v = "---"
+	} else if ( last_rtt >= 9999.5 ) {
+		v = fmt3(last_rtt / 1000)
+		unit = "s "
+	} else {
+		v = fmt3(last_rtt)
+	}
+	BIGW = big(v)
+	BIGUNIT = unit
+	BIGC = (received > 0 && STATE == "live") ? heat(pos(last_rtt)) : C_DIM
+}
+
+function slim_top(   s) {
+	lb()
+	status_chip()
+	if ( LW + 2 + vis(TARGET_NAME) <= W ) {
+		la("  ", "")
+		la(TARGET_NAME, BOLD)
+	}
+	if ( received > 0 ) {
+		s = fmt3(last_rtt)
+		if ( LW + 5 + vis(s) <= W ) {
+			la("  ", "")
+			la(s, (STATE == "live") ? heat(pos(last_rtt)) : C_DIM)
+			la(" ms", C_LABEL)
+		}
+	}
+	if ( MSG_STREAK ) {
+		s = G_WARN " " MSG_TEXT ((MSG_TIMES > 1) ? " " G_TIMES MSG_TIMES : "")
+		if ( LW + 2 < W ) {
+			la("  ", "")
+			la(cut(s, W - LW), msg_color(MSG_TEXT))
+		}
+	} else {
+		s = "up " fmt_dur(NOW - START_T)
+		if ( LW + 2 + vis(s) <= W ) la("  " s, C_LABEL)
+	}
+	return LS
+}
+
+function footer_build(   rows, nrows, i, sw) {
+	FT = footer_tier()
+	FN = 0
+	if ( FT == 0 ) return
+	STATE = status_state()
+
+	if ( FT == 1 ) {
+		FL[FN++] = slim_top()
+		if ( USE_GLOBALSTATS ) {
+			session_row(W)
+			FL[FN++] = LS
+		}
+		if ( USE_RECENTSTATS && LAST_N > 0 ) {
+			recent_row(W)
+			FL[FN++] = LS
+		}
+		if ( USE_LEGEND && LINES >= 8 ) {
+			legend_line()
+			if ( LW <= W ) FL[FN++] = LS
+		}
+		return
+	}
+
+	FL[FN++] = footer_top()
+	sw = W - 23
+	nrows = 0
+	if ( USE_GLOBALSTATS ) {
+		session_row(sw)
+		ROWS[++nrows] = LS
+		ROWW[nrows] = LW
+	}
+	if ( USE_RECENTSTATS && LAST_N > 0 ) {
+		recent_row(sw)
+		ROWS[++nrows] = LS
+		ROWW[nrows] = LW
+	}
+	quality_row(sw)
+	ROWS[++nrows] = LS
+	ROWW[nrows] = LW
+
+	footer_big()
+	for ( i = 1 ; i <= 3 ; i++ ) {
+		lb()
+		la(G_V, C_FRAME)
+		la(" " rep(" ", 13 - BIGW), "")
+		la((i == 1) ? BIG1 : (i == 2) ? BIG2 : BIG3, BIGC)
+		la(" ", "")
+		la((i == 1) ? BIGUNIT : "  ", C_LABEL)
+		la(" ", "")
+		la(G_V, C_FRAME)
+		la(" ", "")
+		if ( i <= nrows ) lraw(ROWS[i], ROWW[i])
+		lpadto(W - 1)
+		la(G_V, C_FRAME)
+		FL[FN++] = LS
+	}
+	FL[FN++] = footer_bottom()
+}
+
+# Redraws the panel below the band (or at the fresh line), then puts the
+# cursor back where the next bar goes. While the panel is still on screen as
+# it was last drawn, only the lines that changed are written again.
+function footer_draw(   i, s, same) {
+	if ( ANCHOR == "none" ) return
+	footer_build()
+	same = (FOOT_VALID && FOOT_ANCHOR == ANCHOR && FOOT_BAND == BAND_ID && FOOT_N == FN && FOOT_W == W)
+	s = RST
+	if ( ANCHOR == "band" ) {
+		if ( FN == 0 ) {
+			# Clear anything left below, but not the rest of the band line:
+			# nothing is ever printed in its last column.
+			s = s go_col(W) CSI "J"
+		} else if ( same ) {
+			for ( i = 0 ; i < FN ; i++ ) s = s CSI "B" ((FL[i] != FOOT_L[i]) ? "\r" CSI "K" FL[i] : "")
+			s = s CSI FN "A"
+		} else {
+			for ( i = 0 ; i < FN ; i++ ) s = s "\n" CSI "K" FL[i]
+			s = s CSI "J" CSI FN "A"
+		}
+		s = s go_col(GUT + BAND_COL)
+	} else if ( same ) {
+		for ( i = 0 ; i < FN ; i++ ) s = s ((i > 0) ? CSI "B" : "") ((FL[i] != FOOT_L[i]) ? "\r" CSI "K" FL[i] : "")
+		if ( FN > 1 ) s = s CSI (FN - 1) "A"
+		s = s "\r"
+	} else {
+		s = s "\r" CSI "J"
+		for ( i = 0 ; i < FN ; i++ ) s = s ((i > 0) ? "\n" : "") FL[i]
+		if ( FN > 1 ) s = s CSI (FN - 1) "A"
+		s = s "\r"
+	}
+	OUT = OUT s
+	for ( i = 0 ; i < FN ; i++ ) FOOT_L[i] = FL[i]
+	FOOT_VALID = 1
+	FOOT_ANCHOR = ANCHOR
+	FOOT_BAND = BAND_ID
+	FOOT_N = FN
+	FOOT_W = W
+	FOOT_TOP = (FN > 0) ? FL[0] : ""
+	FOOT_STATE = STATE
+	FOOT_FT = FT
+}
+
+# On a tick only the first line changes (the clock, the age, the glowing
+# dot), unless the status itself changed.
+function footer_tick(   top) {
+	if ( ANCHOR == "none" ) return
+	if ( footer_tier() != FOOT_FT || status_state() != FOOT_STATE ) {
+		footer_draw()
+		return
+	}
+	if ( FN == 0 ) return
+	STATE = FOOT_STATE
+	top = (FT == 2) ? footer_top() : slim_top()
+	if ( top == FOOT_TOP ) return
+	FOOT_TOP = top
+	FOOT_L[0] = top
+	if ( ANCHOR == "band" ) {
+		OUT = OUT RST CSI "B" "\r" CSI "K" top CSI "A" go_col(GUT + BAND_COL)
+	} else {
+		OUT = OUT RST "\r" CSI "K" top "\r"
+	}
+}
+############################################################
+# The summary, printed when ping stops.
+
+# Remembers the line being built as field i, with a priority (the lowest is
+# the first to go when they do not fit).
+function fld(i, pr) {
+	F_S[i] = LS
+	F_W[i] = LW
+	F_PR[i] = pr
+}
+
+# Appends fields 1..n separated by gap spaces, leaving out the least
+# important ones until the line fits in w columns.
+function la_fields(n, gap, w,   i, total, worst) {
+	for ( i = 1 ; i <= n ; i++ ) F_IN[i] = 1
+	while ( 1 ) {
+		total = LW
+		for ( i = 1 ; i <= n ; i++ ) {
+			if ( F_IN[i] ) total += ((total > 0) ? gap : 0) + F_W[i]
+		}
+		if ( total <= w ) break
+		worst = 0
+		for ( i = 1 ; i <= n ; i++ ) {
+			if ( F_IN[i] && (worst == 0 || F_PR[i] < F_PR[worst]) ) worst = i
+		}
+		if ( worst == 0 ) break
+		F_IN[worst] = 0
+	}
+	for ( i = 1 ; i <= n ; i++ ) {
+		if ( !F_IN[i] ) continue
+		if ( LW > 0 ) la(rep(" ", gap), "")
+		lraw(F_S[i], F_W[i])
+	}
+}
+
+function card_line(s, w) {
+	lb()
+	la(G_V " ", C_FRAME)
+	if ( w > 0 ) lraw(s, w)
+	lpadto(CARD_W - 2)
+	la(" " G_V, C_FRAME)
+	OUT = OUT LS "\n"
+}
+
+function card_value(label, v, pr, i) {
+	lb()
+	la(label " ", C_LABEL)
+	la(fmt3(v), (label == "avg") ? BOLD : "")
+	fld(i, pr)
+}
+
+# The whole session in w columns, from the timeline bins, into TL1 (top
+# line) and TL2 (bottom line, or the only one when not tall).
+function timeline_render(w, tall,   nb, cols, c, b, b0, b1, n, sum, l, rtt, L, col) {
+	TL1 = TL2 = ""
+	nb = TL_I + ((TL_C > 0) ? 1 : 0)
+	cols = (nb < w) ? nb : w
+	for ( c = 0 ; c < cols ; c++ ) {
+		b0 = int(c * nb / cols)
+		b1 = int((c + 1) * nb / cols)
+		if ( b1 <= b0 ) b1 = b0 + 1
+		n = sum = l = 0
+		for ( b = b0 ; b < b1 ; b++ ) {
+			n += TL_N[b]
+			sum += TL_SUM[b]
+			l += TL_L[b]
+		}
+		if ( n == 0 || l * 5 >= n + l ) {
+			TL1 = TL1 (tall ? C_LOSTBG " " RST : "")
+			TL2 = TL2 C_LOST G_LOST RST
+			continue
+		}
+		rtt = sum / n
+		col = bar_color(rtt, tall)
+		if ( tall ) {
+			L = level(rtt, 16)
+			TL1 = TL1 col ((L > 8) ? BLK[L - 8] : " ") RST
+			TL2 = TL2 col ((L > 8) ? BLK[8] : BLK[L]) RST
+		} else {
+			TL2 = TL2 col BLK[level(rtt, 8)] RST
+		}
+	}
+	return cols
+}
+
+# A histogram bar for frac (0..1) of w columns, in eighths of a cell.
+function hbar(frac, w,   x, full, rem, s) {
+	x = frac * w
+	full = int(x)
+	rem = int((x - full) * 8)
+	s = rep(EIGHTH[8], full)
+	if ( rem > 0 && full < w ) s = s EIGHTH[rem]
+	if ( s == "" && frac > 0 ) s = USE_UNICODE ? EIGHTH[1] : "#"
+	return s
+}
+
+# A range of milliseconds, in seconds from 1 s up.
+function range_label(lo, hi) {
+	if ( lo >= 1000 ) return fmt_num(lo / 1000) G_DASH fmt_num(hi / 1000) " s"
+	return fmt_num(lo) G_DASH fmt_num(hi) " ms"
+}
+
+function bucket_label(idx,   lo, hi) {
+	lo = h125_lo(idx)
+	hi = h125_lo(idx + 1)
+	# Anything faster than 0.01 ms is counted in the lowest bucket.
+	if ( idx <= -6 ) return "<" fmt_num(hi) " ms"
+	return range_label(lo, hi)
+}
+
+function summary(   iw, name, ip, right, f, big_ok, avg, v, unit, c, i, n, nb, xs, xw, tw, nrows, cols, idx, j, lbw, maxc, hbw, cnt, total, lab, gap, label) {
+	total = received + lost
+	CARD_W = IS_TERMINAL ? lesser(W, 100) : lesser(greater(COLUMNS - 1, 60), 100)
+	iw = CARD_W - 4
+	avg = avg_rtt()
+
+	# ╭─ ◆ host  ip ──────────────────── 14:02:11 → 14:06:23 · 4m12s ─╮
+	name = TARGET_NAME
+	ip = (TARGET_IP != "") ? "  " TARGET_IP : ""
+	right = clock(START_T) " " G_ARROW " " clock(NOW) " " G_SEP " " fmt_dur(NOW - START_T)
+	f = CARD_W - 10 - vis(name) - vis(ip) - vis(right)
+	if ( f < 1 && ip != "" ) {
+		f += vis(ip)
+		ip = ""
+	}
+	if ( f < 1 ) {
+		f += vis(right) + 1
+		right = ""
+	}
+	if ( f < 1 ) {
+		name = cut(name, vis(name) + f - 1)
+		f = 1
+	}
+	lb()
+	la(G_TL G_H " ", C_FRAME)
+	la(G_DIAMOND " ", C_OK)
+	la(name, BOLD)
+	la(ip, C_LABEL)
+	la(" " rep(G_H, f), C_FRAME)
+	if ( right != "" ) {
+		la(" " right, C_LABEL)
+		la(" " G_H G_TR, C_FRAME)
+	} else {
+		la(G_H G_H G_TR, C_FRAME)
+	}
+	OUT = OUT LS "\n"
+	card_line("", 0)
+
+	# The numbers, next to the average in big digits when there is room.
+	big_ok = USE_UNICODE && iw >= 64
+	tw = big_ok ? iw - 20 : iw
+
+	n = 0
+	if ( !big_ok && received > 0 ) {
+		lb()
+		la("avg ", C_LABEL)
+		la(fmt3(avg), heat(pos(avg)) BOLD)
+		la(" ms", C_LABEL)
+		fld(++n, 9)
+	}
+	lb()
+	la(total "", BOLD)
+	la(" sent", C_LABEL)
+	fld(++n, 7)
+	lb()
+	la(received "", "")
+	la(" received", C_LABEL)
+	fld(++n, 6)
+	lb()
+	la(lost "", (lost > 0) ? C_BAD : "")
+	la(" lost ", C_LABEL)
+	la("(", C_LABEL)
+	la(fmt_pct(loss_pct()), loss_color(loss_pct()))
+	la(")", C_LABEL)
+	fld(++n, 8)
+	nb = n
+	if ( dups > 0 ) {
+		lb()
+		la(dups "", C_WARN)
+		la(" duplicated", C_LABEL)
+		fld(++n, 5)
+	}
+	if ( late > 0 ) {
+		lb()
+		la(late "", C_WARN)
+		la(" late", C_LABEL)
+		fld(++n, 4)
+	}
+	lb()
+	la_fields(n, 3, tw)
+	ROWS[1] = LS
+	ROWW[1] = LW
+	nrows = 1
+	# The duplicate and late counts that did not fit get a row of their own,
+	# below the others.
+	xs = ""
+	xw = 0
+	for ( i = nb + 1 ; i <= n ; i++ ) {
+		if ( F_IN[i] ) continue
+		xs = xs ((xw > 0) ? "   " : "") F_S[i]
+		xw += ((xw > 0) ? 3 : 0) + F_W[i]
+	}
+
+	if ( received > 0 ) {
+		card_value("min", min_rtt, 5, 1)
+		card_value("p50", percentile(0.50), 3, 2)
+		card_value("p95", percentile(0.95), 4, 3)
+		card_value("p99", percentile(0.99), 2, 4)
+		card_value("max", max_rtt, 5, 5)
+		lb()
+		la_fields(5, 3, tw)
+		ROWS[++nrows] = LS
+		ROWW[nrows] = LW
+
+		lb()
+		la("jitter ", C_LABEL)
+		la(fmt3(jitter()), "")
+		la(" ms", C_LABEL)
+		fld(1, 2)
+		v = mos(avg, jitter(), loss_pct())
+		c = mos_color(v)
+		lb()
+		la("MOS ", C_LABEL)
+		la(sprintf("%.2f", v), c)
+		la(" ", "")
+		for ( i = 1 ; i <= 5 ; i++ ) la((i <= mos_segs(v)) ? G_MOS_ON : G_MOS_OFF, (i <= mos_segs(v)) ? c : C_FRAME)
+		la(" " mos_word(v), c)
+		fld(2, 1)
+		lb()
+		la_fields(2, 3, tw)
+		ROWS[++nrows] = LS
+		ROWW[nrows] = LW
+	} else {
+		lb()
+		la("no replies", C_BAD)
+		ROWS[++nrows] = LS
+		ROWW[nrows] = LW
+	}
+	if ( xw > 0 ) {
+		ROWS[++nrows] = xs
+		ROWW[nrows] = xw
+	}
+
+	if ( big_ok ) {
+		if ( received == 0 ) {
+			v = "---"
+			unit = ""
+		} else if ( avg >= 9999.5 ) {
+			v = fmt3(avg / 1000)
+			unit = "s"
+		} else {
+			v = fmt3(avg)
+			unit = "ms"
+		}
+		big(v)
+		c = (received > 0) ? heat(pos(avg)) : C_DIM
+		for ( i = 1 ; i <= 3 || i <= nrows ; i++ ) {
+			lb()
+			if ( i <= 3 ) {
+				la(rep(" ", 13 - vis(BIG1)), "")
+				la((i == 1) ? BIG1 : (i == 2) ? BIG2 : BIG3, c)
+				la(" ", "")
+				la((i == 1) ? unit : (i == 3 && received > 0) ? "avg" : "", C_LABEL)
+			}
+			lpadto(20)
+			if ( i <= nrows ) lraw(ROWS[i], ROWW[i])
+			card_line(LS, LW)
+		}
+	} else {
+		for ( i = 1 ; i <= nrows ; i++ ) card_line(ROWS[i], ROWW[i])
+	}
+
+	# The session, squeezed into one row of bars.
+	if ( received > 0 && TL_I * TL_SPAN + TL_C >= 2 ) {
+		card_line("", 0)
+		cols = timeline_render(iw, USE_UNICODE)
+		if ( USE_UNICODE ) card_line(TL1, cols)
+		card_line(TL2, cols)
+		if ( cols >= 20 ) {
+			lb()
+			la(clock(START_T), C_LABEL)
+			la(rep(" ", cols - 16), "")
+			la(clock(NOW), C_LABEL)
+			card_line(LS, LW)
+		}
+	}
+
+	# How the replies were spread, in 1-2-5 buckets.
+	if ( received > 0 ) {
+		card_line("", 0)
+		lbw = (lost > 0) ? 4 : 0
+		maxc = lost
+		for ( idx = H125_LO ; idx <= H125_HI ; idx++ ) {
+			# (gawk 5.4 reads back garbage from an unset element once it has
+			# been passed to a function, so they are never passed.)
+			if ( idx in H125 ) {
+				lab[idx] = bucket_label(idx)
+				cnt = H125[idx]
+				if ( cnt > maxc ) maxc = cnt
+			} else {
+				# A run of empty buckets shows as one row, so gaps are seen.
+				j = idx
+				while ( !((j + 1) in H125) ) j++
+				gap[idx] = j
+				lab[idx] = range_label(h125_lo(idx), h125_lo(j + 1))
+			}
+			lbw = greater(lbw, vis(lab[idx]))
+			if ( idx in gap ) idx = gap[idx]
+		}
+		hbw = iw - lbw - 10
+		for ( idx = H125_LO ; hbw >= 1 && idx <= H125_HI ; idx++ ) {
+			lb()
+			la(lpad(lab[idx], lbw), (idx in gap) ? C_DIM : C_LABEL)
+			la("  ", "")
+			if ( idx in gap ) {
+				lpadto(lbw + 2 + hbw + 2)
+				la(lpad("0%", 6), C_DIM)
+				idx = gap[idx]
+			} else {
+				cnt = H125[idx]
+				la(hbar(cnt / maxc, hbw), heat(pos(sqrt(h125_lo(idx) * h125_lo(idx + 1)))))
+				lpadto(lbw + 2 + hbw + 2)
+				la(lpad(sprintf("%.1f%%", cnt * 100 / total), 6), "")
+			}
+			card_line(LS, LW)
+		}
+		if ( lost > 0 && hbw >= 1 ) {
+			lb()
+			la(lpad("lost", lbw), C_LABEL)
+			la("  ", "")
+			la(hbar(lost / maxc, hbw), C_BAD)
+			lpadto(lbw + 2 + hbw + 2)
+			la(lpad(sprintf("%.1f%%", lost * 100 / total), 6), C_BAD)
+			card_line(LS, LW)
+		}
+	}
+
+	# ╰──────────────────────────────────────────── prettyping 2.0.0 ─╯
+	label = MYNAME " " VERSION
+	f = CARD_W - 5 - vis(label)
+	lb()
+	if ( f < 1 ) {
+		la(G_BL rep(G_H, CARD_W - 2) G_BR, C_FRAME)
+	} else {
+		la(G_BL rep(G_H, f) " ", C_FRAME)
+		la(label, C_DIM)
+		la(" " G_H G_BR, C_FRAME)
+	}
+	OUT = OUT LS "\n"
+}
+
+############################################################
+# Lines from ping
+
+# What ping prints after its "--- host ping statistics ---" line is replaced
+# by the summary. Only its count of transmitted packets is used: it tells
+# about packets at the end that were lost without a word (iputils, busybox
+# and ping6 print nothing for those).
+function ping_summary(line,   a, tx, rx, room, last) {
+	# "5 packets transmitted, 4 received", or from httping "5 connects, 4 ok"
+	if ( line !~ /packets transmitted|^[0-9]+ connects, / ) return
+	split(line, a, " ")
+	tx = a[1] + 0
+	rx = -1
+	if ( match(line, /[0-9]+ (packets )?received|[0-9]+ ok/) ) rx = substr(line, RSTART, RLENGTH) + 0
+	# Whatever was not understood here, there are no more losses than ping says.
+	room = (rx >= 0) ? tx - rx - lost : tx
+	# On ^C, the packet that was still in flight is counted as transmitted.
+	if ( !(COUNT > 0 && tx >= COUNT) ) tx--
+	if ( tx <= 0 ) return
+	if ( !HAVE_SEQ ) start_seq((FIRST_SEQ >= 0) ? FIRST_SEQ : 0)
+	last = FIRST + tx - 1
+	if ( last - LAST_SEQ > room ) last = LAST_SEQ + room
+	if ( last > LAST_SEQ ) {
+		banner()
+		lose_until(last)
+	}
+}
+
+function handle_line(line,   raw, rtt, x) {
+	if ( IN_SUMMARY ) {
+		ping_summary(line)
+		return
+	}
+	if ( SKIP_DUMP ) {
+		SKIP_DUMP = 0
+		if ( line ~ /^ *[0-9a-fA-F]+ +[0-9a-fA-F]+ +[0-9a-fA-F]+ / ) return
+	}
+
+	if ( line ~ /^(\[[0-9.]+\] |[0-9][0-9]:[0-9][0-9]:[0-9][0-9][.][0-9]+ )?[0-9]+ bytes from .*[:,] (icmp_)?[rs]eq=[0-9]+ .*time[=<] *[0-9.]+ *ms/ ) {
+		# 64 bytes from 8.8.8.8: icmp_seq=1 ttl=49 time=184 ms
+		# 64 bytes from 1.1.1.1: seq=0 ttl=63 time=8.585 ms (busybox)
+		# [1792972566.494012] 64 bytes from 1.1.1.1: icmp_seq=1 ttl=63 time=13.3 ms (iputils -D)
+		# 09:05:29.509306 64 bytes from 1.1.1.1: icmp_seq=0 ttl=64 time=0.075 ms (macOS --apple-time)
+		match(line, /[rs]eq=[0-9]+/)
+		raw = substr(line, RSTART + 4, RLENGTH - 4) + 0
+		match(line, /time[=<] *[0-9.]+/)
+		x = substr(line, RSTART + 5, RLENGTH - 5)
+		rtt = x + 0
+		on_reply(raw, rtt, line ~ /DUP!/)
+	} else if ( line ~ /onnected to.*, seq=[0-9]+ time= *[0-9.]+ *ms/ ) {
+		# Sample line from httping:
+		# connected to 200.149.119.168:80 (273 bytes), seq=0 time=129.86 ms
+		match(line, /seq=[0-9]+/)
+		raw = substr(line, RSTART + 4, RLENGTH - 4) + 0
+		match(line, /time= *[0-9.]+/)
+		x = substr(line, RSTART + 5, RLENGTH - 5)
+		rtt = x + 0
+		on_reply(raw, rtt, 0)
+	} else if ( line ~ /^Request timeout for icmp_seq [0-9]+/ ) {
+		# Reply timeout is printed on Mac OS X.
+		x = line
+		sub(/^Request timeout for icmp_seq /, "", x)
+		on_timeout(x + 0)
+	} else if ( line ~ /^(\[[0-9.]+\] )?no answer yet for icmp_seq=[0-9]+/ ) {
+		# iputils with -O.
+		x = line
+		sub(/^(\[[0-9.]+\] )?no answer yet for icmp_seq=/, "", x)
+		on_timeout(x + 0)
+	} else if ( line ~ /^PING / || line ~ /^PING6\(/ ) {
+		on_header(line)
+	} else if ( line ~ /^--- .* ping6? statistics ---/ ) {
+		IN_SUMMARY = 1
+	} else if ( line == "" ) {
+		# Do nothing on blank lines.
+	} else if ( line == "error shutting down ssl" ) {
+		# Common error message when using httping, ignore it.
+	} else if ( line ~ /^Vr HL TOS/ ) {
+		# BSD ping follows an ICMP error with a dump of the IP header, over
+		# this line and the next.
+		SKIP_DUMP = 1
+	} else {
+		message(line)
+		# From 10.1.1.160 icmp_seq=22 Destination Host Unreachable
+		if ( line ~ /icmp_seq=[0-9]+ .*([Uu]nreachable|[Ee]xceeded)/ ) {
+			x = line
+			sub(/.*icmp_seq=/, "", x)
+			on_timeout(x + 0)
+		}
+	}
+}
+
+function on_tick() {
+	TICKS++
+	NOW = now()
+	if ( WINCH_PENDING && TICKS - WINCH_TICK >= 2 ) winch_apply()
+	# ping6 prints nothing at all while nothing comes back.
+	if ( !BANNER_DONE && NOW - START_T >= 2 ) banner()
+	if ( !DIRTY && !WINCH_PENDING ) {
+		footer_tick()
+		title_update()
+	}
+}
+
+############################################################
+# Initializations
+BEGIN {
+	LOG10 = log(10)
+	LOG_FH = log(1.02)
+	NICE_N = split("1 1.2 1.5 2 2.5 3 4 5 6 8", NICE, " ")
+
+	IS_TERMINAL += 0
+	USE_COLOR += 0
+	DEPTH += 0
+	USE_MULTICOLOR += 0
+	USE_UNICODE += 0
+	USE_COMPACT += 0
+	USE_LEGEND += 0
+	USE_GLOBALSTATS += 0
+	USE_RECENTSTATS += 0
+	USE_SUMMARY += 0
+	USE_TITLE += 0
+	LAST_N = int(LAST_N)
+	OVERRIDE_COLUMNS = int(OVERRIDE_COLUMNS)
+	OVERRIDE_LINES = int(OVERRIDE_LINES)
+	RTT_MIN += 0
+	RTT_MAX += 0
+	COUNT = int(COUNT)
+	INTERVAL += 0
+	if ( INTERVAL <= 0 ) INTERVAL = 1
+	TICK += 0
+
+	init_colors()
+	init_glyphs()
+
+	# These are sane defaults, in case we cannot query the actual terminal size
+	LINES    = 24
+	COLUMNS  = 80
+	if ( IS_TERMINAL ) {
+		get_terminal_size()
+	} else {
+		if ( OVERRIDE_COLUMNS > 0 ) COLUMNS = OVERRIDE_COLUMNS
+		if ( OVERRIDE_LINES   > 0 ) LINES   = OVERRIDE_LINES
+		W = COLUMNS - 1
+	}
+	TALL = 0
+
+	clock_init()
+	STALL = INTERVAL * 2 + 0.5
+	if ( STALL < 2 ) STALL = 2
+
+	if ( RTT_MIN > 0 && RTT_MAX > 0 ) {
+		set_scale(RTT_MIN, RTT_MAX)
+	} else if ( RTT_MIN > 0 ) {
+		set_scale(RTT_MIN, RTT_MIN * 40)
+	} else if ( RTT_MAX > 0 ) {
+		set_scale(RTT_MAX / 40, RTT_MAX)
+	}
+
+	FIRST_SEQ = -1
+	ANCHOR = "none"
+	TL_CAP = 512
+	TL_SPAN = 1
+	TL_I = TL_C = 0
+	received = lost = dups = late = 0
+
+	LABW = greater(8, vis("last " LAST_N))
+	split("min avg p95 max jit loss", SORDER, " ")
+	split("avg loss max min jit p95", SPRIO, " ")
+	SFW["min"] = SFW["avg"] = SFW["p95"] = SFW["max"] = SFW["jit"] = 9
+	SFW["loss"] = 11
+
+	if ( IS_TERMINAL ) {
+		OUT = OUT CSI "?25l"
+		if ( USE_TITLE ) OUT = OUT CSI "22;2t"
+		flush()
+	}
+}
+
+############################################################
+# Main loop
+{
+	if ( $0 == "TICK" ) {
+		on_tick()
+	} else {
+		refresh_now()
+		if ( $0 == "SIGWINCH" ) {
+			on_winch()
+		} else if ( $0 == "SIGCONT" ) {
+			on_cont()
+		} else {
+			handle_line($0)
+		}
+	}
+
+	if ( DIRTY && IS_TERMINAL && !WINCH_PENDING ) {
+		DIRTY = 0
+		margin_update()
+		footer_draw()
+		title_update()
+	}
+
+	# Not needed when the output is a terminal, but does not hurt either.
+	flush()
+}
+
+END {
+	NOW = now()
+	if ( IS_TERMINAL ) {
+		if ( WINCH_PENDING ) winch_apply()
+		band_end()
+		if ( ANCHOR != "none" ) OUT = OUT RST "\r" CSI "J"
+	}
+	msg_streak_end()
+	plain_row_end()
+	if ( USE_SUMMARY && received + lost > 0 ) summary()
+	if ( IS_TERMINAL ) {
+		OUT = OUT RST CSI "?25h"
+		if ( USE_TITLE ) OUT = OUT CSI "23;2t"
+	}
+	flush()
+}'
 
 # Warning! Ugly code ahead!
 # The code is so ugly that the comments explaining it are
@@ -220,672 +2653,83 @@ export LC_ALL=C
 
 # Ignore Ctrl+C here.
 # If I don't do this, this shell script is killed before
-# ping and gawk can finish their work.
-trap '' 2
+# ping and awk can finish their work.
+trap '' INT
+
+prepare_terminal
+trap 'on_fatal_signal 143' TERM
+trap 'on_fatal_signal 129' HUP
+if [[ "${IS_TERMINAL}" = 1 ]] ; then
+	# On ^Z, the middle subshell below stops everything once it has handed the
+	# terminal back; this shell must not stop before that.
+	trap ':' TSTP
+fi
 
 # Now the ugly code.
 (
 	"${PING_BIN}" "${PING_PARAMS[@]}" &
-	PING_PID="$!"
-
-	# Commented out, because it looks like this line is not needed
-	#trap "kill -2 $PING_PID ; exit 1" 2  # Catch Ctrl+C here
-
-	wait
+	# Exit with the status of ping itself.
+	wait "$!"
 ) 2>&1 | (
 	if [ "${IS_TERMINAL}" = 1 ]; then
-		# Print a message to notify the awk script about terminal size change.
-		trap "echo SIGWINCH" 28
+		trap on_tstp TSTP
+		trap on_cont CONT
+
+		# A heartbeat, so the panel keeps time even while ping is silent, and
+		# the notice of a terminal size change. bash 4 and later run a WINCH
+		# trap only once the builtin it interrupted returns, which the read
+		# loop below may not do for a long time; this wait returns at once.
+		# Each echo is a single write of a whole line, like those of the loop
+		# below, so they never land in the middle of a line.
+		(
+			trap "echo SIGWINCH" WINCH
+			while : ; do
+				sleep "${TICK}" > /dev/null 2>&1 &
+				wait "$!"
+				status="$?"
+				if [ "${status}" != 0 ] && [ "${status}" -le 128 ] ; then
+					exit
+				fi
+				echo TICK || exit
+			done
+		) &
+		TICKER="$!"
 	fi
 
-	# The trap must be in another subshell because otherwise it will interrupt
-	# the "wait" commmand.
-	while read line; do
-		echo -E "$line"
+	while IFS= read -r line || [ -n "${line}" ]; do
+		printf '%s\n' "${line}"
 	done
-) 2>&1 | "${AWK_BIN}" "${AWK_PARAMS[@]}" '
-# Weird that awk does not come with abs(), so I need to implement it.
-function abs(x) {
-	return ( (x < 0) ? -x : x )
-}
 
-# Ditto for ceiling function.
-function ceil(x) {
-	return (x == int(x)) ? x : int(x) + 1
-}
-
-# Local variables MUST be declared in argument list, else they are
-# seen as global. Ugly, but that is how awk works.
-function get_terminal_size(SIZE, SIZEA, HAS_DETECTED, CMD) {
-	HAS_DETECTED = 0
-
-	CMD = "stty -f /dev/tty size 2> /dev/null"
-
-	if ( (CMD | getline SIZE) == 1 ) {
-		split(SIZE, SIZEA, " ")
-		LINES   = int(SIZEA[1])
-		COLUMNS = int(SIZEA[2])
-		HAS_DETECTED = 1
-	}
-	close(CMD)
-
-	if ( HAS_DETECTED == 0 ) {
-		CMD = "tput lines"
-		if ( (CMD | getline SIZE) == 1 ) {
-			LINES = int(SIZE)
-			HAS_DETECTED = 1
-		}
-		close(CMD)
-
-		CMD = "tput cols"
-		if ( (CMD | getline SIZE) == 1 ) {
-			COLUMNS = int(SIZE)
-			HAS_DETECTED = 1
-		}
-		close(CMD)
-	}
-
-	if ( int('"${OVERRIDE_COLUMNS}"') ) { COLUMNS = int('"${OVERRIDE_COLUMNS}"') }
-	if ( int('"${OVERRIDE_LINES}"')   ) { LINES   = int('"${OVERRIDE_LINES}"')   }
-}
-
-############################################################
-# Functions related to cursor handling
-
-# Function called whenever a non-dotted line is printed.
-#
-# It will move the cursor to the line next to the statistics and
-# restore the default color.
-function other_line_is_printed() {
-	if ( IS_PRINTING_DOTS ) {
-		if ( '"${IS_TERMINAL}"' ) {
-			printf( ESC_DEFAULT ESC_NEXTLINE ESC_NEXTLINE "\n" )
-		} else {
-			printf( ESC_DEFAULT "\n" )
-			print_statistics_bar()
-		}
-	}
-	IS_PRINTING_DOTS = 0
-	CURR_COL = 0
-}
-
-# Function called whenever a non-dotted line is repeated.
-function other_line_is_repeated() {
-	if ( other_line_times < 2 ) {
-		return
-	}
-	if ( '"${IS_TERMINAL}"' ) {
-		printf( ESC_DEFAULT ESC_ERASELINE "\r" )
-	}
-	printf( "Last message repeated %d times.", other_line_times )
-	if ( ! '"${IS_TERMINAL}"' ) {
-		printf( "\n" )
-	}
-}
-
-# Function called whenever the repeating line has changed.
-function other_line_finished_repeating() {
-	if ( other_line_times >= 2 ) {
-		if ( '"${IS_TERMINAL}"' ) {
-			printf( "\n" )
-		} else {
-			other_line_is_repeated()
-		}
-	}
-	other_line = ""
-	other_line_times = 0
-}
-
-# Prints the newlines required for the live statistics.
-#
-# I need to print some newlines and then return the cursor back to its position
-# to make sure the terminal will scroll.
-#
-# If the output is not a terminal, break lines on every LAST_N dots.
-function print_newlines_if_needed() {
-	if ( '"${IS_TERMINAL}"' ) {
-		# COLUMNS-1 because I want to avoid bugs with the cursor at the last column
-		if ( CURR_COL >= COLUMNS-1 ) {
-			CURR_COL = 0
-		}
-		if ( CURR_COL == 0 ) {
-			if ( IS_PRINTING_DOTS ) {
-				printf( "\n" )
-			}
-
-			# Reserve the extra lines for printing the statistics.
-			if ( '"${USE_GLOBALSTATS}"'               ) { printf( ESC_DEFAULT "\n" ) }
-			if ( '"${USE_RECENTSTATS}"' && LAST_N > 0 ) { printf( ESC_DEFAULT "\n" ) }
-			if ( '"${USE_RECENTSTATS}"' && LAST_N > 0 ) { printf( ESC_CURSORUP ) }
-			if ( '"${USE_GLOBALSTATS}"'               ) { printf( ESC_CURSORUP ) }
-
-			# Erase the (new) current line, to make it clean for the next response dots.
-			printf( ESC_ERASELINE )
-		}
-	} else {
-		if ( CURR_COL >= LAST_N && LAST_N > 0 ) {
-			CURR_COL = 0
-			printf( ESC_DEFAULT "\n" )
-			print_statistics_bar()
-		}
-	}
-	IS_PRINTING_DOTS = 1
-}
-
-############################################################
-# Functions related to the data structure of "Last N" statistics.
-
-# Clears the data structure.
-function clear(d) {
-	d["index"] = 0  # The next position to store a value
-	d["size"]  = 0  # The array size, goes up to LAST_N
-}
-
-# This function stores the value to the passed data structure.
-# The data structure holds at most LAST_N values. When it is full,
-# a new value overwrite the oldest one.
-function store(d, value) {
-	d[d["index"]] = value
-	d["index"]++
-	if ( d["index"] >= d["size"] ) {
-		if ( d["size"] < LAST_N ) {
-			d["size"]++
-		} else {
-			d["index"] = 0
-		}
-	}
-}
-
-############################################################
-# Functions related to processing the received response
-
-function process_rtt(rtt) {
-	# Overall statistics
-	last_rtt = rtt
-	total_rtt += rtt
-	if ( last_seq == 0 ) {
-		min_rtt = max_rtt = rtt
-	} else {
-		if ( rtt < min_rtt ) min_rtt = rtt
-		if ( rtt > max_rtt ) max_rtt = rtt
-	}
-
-	# "Last N" statistics
-	store(lastn_rtt,rtt)
-}
-
-function lost_a_packet() {
-	print_newlines_if_needed()
-	print_missing_response()
-
-	last_seq++
-	lost++
-	store(lastn_lost, 1)
-}
-
-############################################################
-# Functions related to printing the fancy ping response
-
-# block_index, n, w are just local variables.
-function print_response_legend(i, n, w) {
-	if ( ! '"${USE_LEGEND}"' ) {
-		return
-	}
-	if ( BLOCK_LEN > 1 ) {
-		# w counts the cursor position in the current line. Because of the
-		# escape codes, I need to jump through some hoops in order to count the
-		# position correctly.
-		w = 0
-		n = "0 "
-		w += length(n) + 1
-
-		printf( n BLOCK[0] ESC_DEFAULT )
-
-		for ( i=1 ; i<BLOCK_LEN ; i++ ) {
-			n = sprintf( "%d ", BLOCK_RTT_MIN + ceil((i-1) * BLOCK_RTT_RANGE / (BLOCK_LEN - 2)) )
-			w += length(n) + 1
-
-			# Avoid breaking the legend at the end of the line.
-			# Also avoids a background color change right at
-			# the edge of the screen. (If it happens, the entire next line
-			# will have that background color, which is not desired.)
-			if ( '"${IS_TERMINAL}"' && w + 1 >= COLUMNS ) {
-				printf( "\n" )
-				w = length(n) + 1
-			} else {
-				printf( " " )
-				w += 1
-			}
-
-			printf( n BLOCK[i] ESC_DEFAULT )
-		}
-		printf( " ∞\n" )
-	}
-
-	# Useful code for debugging.
-	#for ( i=0 ; i<=BLOCK_RTT_MAX ; i++ ) {
-	#	print_received_response(i)
-	#	printf( ESC_DEFAULT "%4d\n", i )
-	#}
-}
-
-# block_index is just a local variable.
-function print_received_response(rtt, block_index) {
-	if ( rtt < BLOCK_RTT_MIN ) {
-		block_index = 0
-	} else if ( rtt >= BLOCK_RTT_MAX ) {
-		block_index = BLOCK_LEN - 1
-	} else {
-		block_index = 1 + int((rtt - BLOCK_RTT_MIN) * (BLOCK_LEN - 2) / BLOCK_RTT_RANGE)
-	}
-	printf( BLOCK[block_index] )
-	CURR_COL++
-}
-
-function print_missing_response(rtt) {
-	printf( ESC_RED "!" )
-	CURR_COL++
-}
-
-############################################################
-# Functions related to printing statistics
-
-# All arguments are just local variables.
-function print_global_stats(percentage_lost, avg_rtt) {
-	# Handling division by zero.
-	# Note that mawk does not consider division by zero an error, while all
-	# other awk implementations abort in such case.
-	# https://stackoverflow.com/questions/14581966/why-does-awk-produce-different-results-for-division-by-zero
-
-	avg_rtt = ( received > 0 ) ? (total_rtt/received) : 0
-	percentage_lost = ( lost+received > 0 ) ? (lost*100/(lost+received)) : 0
-
-	if ( '"${IS_TERMINAL}"' ) {
-		printf( "%2d/%3d (%2d%%) lost; %4.0f/" ESC_BOLD "%4.0f" ESC_DEFAULT "/%4.0fms; last: " ESC_BOLD "%4.0f" ESC_DEFAULT "ms",
-			lost,
-			lost+received,
-			percentage_lost,
-			min_rtt,
-			avg_rtt,
-			max_rtt,
-			last_rtt )
-	} else {
-		printf( "%2d/%3d (%2d%%) lost; %4.0f/" ESC_BOLD "%4.0f" ESC_DEFAULT "/%4.0fms",
-			lost,
-			lost+received,
-			percentage_lost,
-			min_rtt,
-			avg_rtt,
-			max_rtt )
-	}
-}
-
-# All arguments are just local variables.
-function print_recent_stats(i, percentage_lost, sum, min, avg, max, diffs) {
-	# Calculate and print the lost packets statistics
-	sum = 0
-	for ( i=0 ; i<lastn_lost["size"] ; i++ ) {
-		sum += lastn_lost[i]
-	}
-	percentage_lost = (lastn_lost["size"] > 0) ? (sum*100/lastn_lost["size"]) : 0
-	printf( "%2d/%3d (%2d%%) lost; ",
-		sum,
-		lastn_lost["size"],
-		percentage_lost )
-
-	# Calculate the min/avg/max rtt times
-	sum = diffs = 0
-	min = max = lastn_rtt[0]
-	for ( i=0 ; i<lastn_rtt["size"] ; i++ ) {
-		sum += lastn_rtt[i]
-		if ( lastn_rtt[i] < min ) min = lastn_rtt[i]
-		if ( lastn_rtt[i] > max ) max = lastn_rtt[i]
-	}
-	avg = (lastn_rtt["size"]) ? (sum/lastn_rtt["size"]) : 0
-
-	# Calculate mdev (mean absolute deviation)
-	for ( i=0 ; i<lastn_rtt["size"] ; i++ ) {
-		diffs += abs(lastn_rtt[i] - avg)
-	}
-	if ( lastn_rtt["size"] > 0 ) {
-		diffs /= lastn_rtt["size"]
-	}
-
-	# Print the rtt statistics
-	printf( "%4.0f/" ESC_BOLD "%4.0f" ESC_DEFAULT "/%4.0f/%4.0fms (last %d)",
-		min,
-		avg,
-		max,
-		diffs,
-		lastn_rtt["size"] )
-}
-
-function print_statistics_bar() {
-	if ( '"${IS_TERMINAL}"' ) {
-		printf( ESC_SAVEPOS ESC_DEFAULT )
-
-		if ( '"${USE_GLOBALSTATS}"' ) {
-			printf( ESC_NEXTLINE ESC_ERASELINE )
-			print_global_stats()
-		}
-		if ( '"${USE_RECENTSTATS}"' && LAST_N > 0 ) {
-			printf( ESC_NEXTLINE ESC_ERASELINE )
-			print_recent_stats()
-		}
-
-		printf( ESC_UNSAVEPOS )
-	} else {
-		if ( '"${USE_GLOBALSTATS}"' ) {
-			print_global_stats()
-			printf( "\n" )
-		}
-		if ( '"${USE_RECENTSTATS}"' && LAST_N > 0 ) {
-			print_recent_stats()
-			printf( "\n" )
-		}
-	}
-}
-
-function print_statistics_bar_if_terminal() {
-	if ( '"${IS_TERMINAL}"' ) {
-		print_statistics_bar()
-	}
-}
-
-############################################################
-# Initializations
-BEGIN {
-	# Easy way to get each value from ping output
-	FS = "="
-
-	############################################################
-	# General internal variables
-
-	# This is needed to keep track of lost packets
-	last_seq = 0
-
-	# The previously printed non-ping-response line
-	other_line = ""
-	other_line_times = 0
-
-	# Variables to keep the screen clean
-	IS_PRINTING_DOTS = 0
-	CURR_COL = 0
-
-	############################################################
-	# Variables related to "overall" statistics
-	received = 0
-	lost = 0
-	total_rtt = 0
-	min_rtt = 0
-	max_rtt = 0
-	last_rtt = 0
-
-	############################################################
-	# Variables related to "last N" statistics
-	LAST_N = int('"${LAST_N}"')
-
-	# Data structures for the "last N" statistics
-	clear(lastn_lost)
-	clear(lastn_rtt)
-
-	############################################################
-	# Terminal height and width
-
-	# These are sane defaults, in case we cannot query the actual terminal size
-	LINES    = 24
-	COLUMNS  = 80
-
-	# Auto-detecting the terminal size
-	get_terminal_size()
-	if ( '"${IS_TERMINAL}"' && COLUMNS <= 50 ) {
-		print "Warning: terminal width is too small."
-	}
-
-	############################################################
-	# ANSI escape codes
-
-	# Color escape codes.
-	# Fortunately, awk defaults any unassigned variable to an empty string.
-	if ( '"${USE_COLOR}"' ) {
-		ESC_DEFAULT = "\033[0m"
-		ESC_BOLD    = "\033[1m"
-		#ESC_BLACK   = "\033[0;30m"
-		#ESC_GRAY    = "\033[1;30m"
-		ESC_RED     = "\033[0;31m"
-		ESC_GREEN   = "\033[0;32m"
-		ESC_YELLOW  = "\033[0;33m"
-		ESC_BLUE    = "\033[0;34m"
-		ESC_MAGENTA = "\033[0;35m"
-		ESC_CYAN    = "\033[0;36m"
-		ESC_WHITE   = "\033[0;37m"
-		ESC_YELLOW_ON_GREEN = "\033[42;33m"
-		ESC_RED_ON_YELLOW   = "\033[43;31m"
-	}
-	# Other escape codes, see:
-	# https://en.wikipedia.org/wiki/ANSI_escape_code
-	# https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
-	ESC_NEXTLINE     = "\n"
-	ESC_CURSORUP     = "\033[A"
-	ESC_CURSORDOWN   = "\033[B"
-	ESC_SCROLLUP     = "\033[S"
-	ESC_SCROLLDOWN   = "\033[T"
-	ESC_ERASELINEEND = "\033[0K"
-	ESC_ERASELINE    = "\033[2K"
-	ESC_SAVEPOS      = "\0337"
-	ESC_UNSAVEPOS    = "\0338"
-
-	# I am avoiding these escapes as they are not listed in:
-	# https://vt100.net/docs/vt100-ug/chapter3.html
-	#ESC_PREVLINE   = "\033[F"
-	#ESC_SAVEPOS    = "\033[s"
-	#ESC_UNSAVEPOS  = "\033[u"
-
-	# I am avoiding this to improve compatibility with (older versions of) tmux
-	#ESC_NEXTLINE   = "\033[E"
-
-	############################################################
-	# Unicode characters (based on https://github.com/holman/spark )
-	if ( '"${USE_UNICODE}"' ) {
-		BLOCK[ 0] = ESC_GREEN "▁"
-		BLOCK[ 1] = ESC_GREEN "▂"
-		BLOCK[ 2] = ESC_GREEN "▃"
-		BLOCK[ 3] = ESC_GREEN "▄"
-		BLOCK[ 4] = ESC_GREEN "▅"
-		BLOCK[ 5] = ESC_GREEN "▆"
-		BLOCK[ 6] = ESC_GREEN "▇"
-		BLOCK[ 7] = ESC_GREEN "█"
-		BLOCK[ 8] = ESC_YELLOW_ON_GREEN "▁"
-		BLOCK[ 9] = ESC_YELLOW_ON_GREEN "▂"
-		BLOCK[10] = ESC_YELLOW_ON_GREEN "▃"
-		BLOCK[11] = ESC_YELLOW_ON_GREEN "▄"
-		BLOCK[12] = ESC_YELLOW_ON_GREEN "▅"
-		BLOCK[13] = ESC_YELLOW_ON_GREEN "▆"
-		BLOCK[14] = ESC_YELLOW_ON_GREEN "▇"
-		BLOCK[15] = ESC_YELLOW_ON_GREEN "█"
-		BLOCK[16] = ESC_RED_ON_YELLOW "▁"
-		BLOCK[17] = ESC_RED_ON_YELLOW "▂"
-		BLOCK[18] = ESC_RED_ON_YELLOW "▃"
-		BLOCK[19] = ESC_RED_ON_YELLOW "▄"
-		BLOCK[20] = ESC_RED_ON_YELLOW "▅"
-		BLOCK[21] = ESC_RED_ON_YELLOW "▆"
-		BLOCK[22] = ESC_RED_ON_YELLOW "▇"
-		BLOCK[23] = ESC_RED_ON_YELLOW "█"
-		if ( '"${USE_MULTICOLOR}"' && '"${USE_COLOR}"' ) {
-			# Multi-color version:
-			BLOCK_LEN = 24
-			BLOCK_RTT_MIN = 10
-			BLOCK_RTT_MAX = 230
-		} else {
-			# Simple version:
-			BLOCK_LEN = 8
-			BLOCK_RTT_MIN = 25
-			BLOCK_RTT_MAX = 175
-		}
-	} else {
-		BLOCK[ 0] = ESC_GREEN "_"
-		BLOCK[ 1] = ESC_GREEN "."
-		BLOCK[ 2] = ESC_GREEN "o"
-		BLOCK[ 3] = ESC_GREEN "O"
-		BLOCK[ 4] = ESC_YELLOW "_"
-		BLOCK[ 5] = ESC_YELLOW "."
-		BLOCK[ 6] = ESC_YELLOW "o"
-		BLOCK[ 7] = ESC_YELLOW "O"
-		BLOCK[ 8] = ESC_RED "_"
-		BLOCK[ 9] = ESC_RED "."
-		BLOCK[10] = ESC_RED "o"
-		BLOCK[11] = ESC_RED "O"
-		if ( '"${USE_MULTICOLOR}"' && '"${USE_COLOR}"' ) {
-			# Multi-color version:
-			BLOCK_LEN = 12
-			BLOCK_RTT_MIN = 20
-			BLOCK_RTT_MAX = 220
-		} else {
-			# Simple version:
-			BLOCK_LEN = 4
-			BLOCK_RTT_MIN = 75
-			BLOCK_RTT_MAX = 225
-		}
-	}
-
-	if ( int('"${RTT_MIN}"') > 0 && int('"${RTT_MAX}"') > 0 ) {
-		BLOCK_RTT_MIN = int('"${RTT_MIN}"')
-		BLOCK_RTT_MAX = int('"${RTT_MAX}"')
-	} else if ( int('"${RTT_MIN}"') > 0 ) {
-		BLOCK_RTT_MIN = int('"${RTT_MIN}"')
-		BLOCK_RTT_MAX = BLOCK_RTT_MIN * (BLOCK_LEN - 1)
-	} else if ( int('"${RTT_MAX}"') > 0 ) {
-		BLOCK_RTT_MAX = int('"${RTT_MAX}"')
-		BLOCK_RTT_MIN = int(BLOCK_RTT_MAX / (BLOCK_LEN - 1))
-	}
-
-	BLOCK_RTT_RANGE = BLOCK_RTT_MAX - BLOCK_RTT_MIN
-	print_response_legend()
-}
-
-############################################################
-# Main loop
-{
-	if ( $0 ~ /^[0-9]+ bytes from .*[:,] icmp_[rs]eq=[0-9]+ (ttl|hlim)=[0-9]+ time=[0-9.]+ *ms/ ) {
-		# Sample line from ping:
-		# 64 bytes from 8.8.8.8: icmp_seq=1 ttl=49 time=184 ms
-		if ( other_line_times >= 2 ) {
-			other_line_finished_repeating()
-		}
-
-		# $1 = useless prefix string
-		# $2 = icmp_seq
-		# $3 = ttl/hlim
-		# $4 = time
-
-		# This must be called before incrementing the last_seq variable!
-		rtt = int($4)
-		process_rtt(rtt)
-
-		seq = int($2)
-
-		while ( last_seq < seq - 1 ) {
-			lost_a_packet()
-		}
-
-		# Received a packet
-		print_newlines_if_needed()
-		print_received_response(rtt)
-
-		# In case of receiving multiple responses with the same seq number, it
-		# is better to use "last_seq = seq" than to increment last_seq.
-		last_seq = seq
-
-		received++
-		store(lastn_lost, 0)
-
-		print_statistics_bar_if_terminal()
-	} else if ( $0 ~ /^.*onnected to.*, seq=[0-9]+ time= *[0-9.]+ *ms/ ) {
-		# Sample line from httping:
-		# connected to 200.149.119.168:80 (273 bytes), seq=0 time=129.86 ms
-		if ( other_line_times >= 2 ) {
-			other_line_finished_repeating()
-		}
-
-		seq = $0
-		sub(/.* seq=/, "", seq)
-		seq = int(seq)
-
-		rtt = $0
-		sub(/.* time=/, "", rtt)
-		rtt = rtt + 0.0
-
-		process_rtt(rtt)
-
-		while ( last_seq < seq - 1 ) {
-			lost_a_packet()
-		}
-
-		# Received a packet
-		print_newlines_if_needed()
-		print_received_response(rtt)
-
-		# In case of receiving multiple responses with the same seq number, it
-		# is better to use "last_seq = seq" than to increment last_seq.
-		last_seq = seq
-
-		received++
-		store(lastn_lost, 0)
-
-		print_statistics_bar_if_terminal()
-	} else if ( $0 == "" ) {
-		# Do nothing on blank lines.
-	} else if ( $0 == "error shutting down ssl" ) {
-		# Common error message when using httping, ignore it.
-	} else if ( $0 ~ /^Request timeout for icmp_seq [0-9]+/ ) {
-		# Reply timeout is printed on Mac OS X.
-
-		if ( other_line_times >= 2 ) {
-			other_line_finished_repeating()
-		}
-
-		lost_a_packet()
-
-		# Making sure the last_seq number is correct.
-		gsub(/.* icmp_seq /, "")
-		seq = int($0)
-		last_seq = seq
-
-		print_newlines_if_needed()
-		print_statistics_bar_if_terminal()
-	} else if ( $0 ~ /^SIGWINCH$/ ) {
-		get_terminal_size()
-
-		if ( IS_PRINTING_DOTS ) {
-			if ( CURR_COL >= COLUMNS-1 ) {
-				# Not enough space anyway.
-			} else {
-				# Making up room in case the number of lines has changed.
-				printf( ESC_NEXTLINE ESC_NEXTLINE ESC_CURSORUP ESC_CURSORUP )
-				# Moving to the correct column and erasing the rest of the line.
-				printf( "\033[" (CURR_COL+1) "G" ESC_DEFAULT ESC_ERASELINEEND )
-			}
-
-			print_newlines_if_needed()
-			print_statistics_bar_if_terminal()
-		}
-	} else {
-		other_line_is_printed()
-		original_line = $0
-		gsub(/icmp_seq[= ][0-9]+/, "")
-		if ( $0 == other_line ) {
-			other_line_times++
-			if ( '"${IS_TERMINAL}"' ) {
-				other_line_is_repeated()
-			}
-		} else {
-			other_line_finished_repeating()
-			other_line = $0
-			other_line_times = 1
-			printf( "%s\n", original_line )
-		}
-	}
-
-	# Not needed when the output is a terminal, but does not hurt either.
-	fflush()
-}'
+	if [ -n "${TICKER}" ]; then
+		kill "${TICKER}" 2> /dev/null
+		wait "${TICKER}" 2> /dev/null
+	fi
+) 2>&1 | "${AWK_BIN}" "${AWK_PARAMS[@]}" \
+	-v MYNAME="${MYNAME}" \
+	-v VERSION="${VERSION}" \
+	-v IS_TERMINAL="${IS_TERMINAL}" \
+	-v USE_COLOR="${USE_COLOR}" \
+	-v DEPTH="${COLOR_DEPTH}" \
+	-v THEME="${THEME}" \
+	-v USE_MULTICOLOR="${USE_MULTICOLOR}" \
+	-v USE_UNICODE="${USE_UNICODE}" \
+	-v USE_COMPACT="${USE_COMPACT}" \
+	-v USE_LEGEND="${USE_LEGEND}" \
+	-v USE_GLOBALSTATS="${USE_GLOBALSTATS}" \
+	-v USE_RECENTSTATS="${USE_RECENTSTATS}" \
+	-v USE_SUMMARY="${USE_SUMMARY}" \
+	-v USE_TITLE="${USE_TITLE}" \
+	-v LAST_N="${LAST_N}" \
+	-v OVERRIDE_COLUMNS="${OVERRIDE_COLUMNS}" \
+	-v OVERRIDE_LINES="${OVERRIDE_LINES}" \
+	-v RTT_MIN="${RTT_MIN}" \
+	-v RTT_MAX="${RTT_MAX}" \
+	-v COUNT="${COUNT}" \
+	-v INTERVAL="${INTERVAL}" \
+	-v TICK="${TICK}" \
+	-v TARGET="${TARGET}" \
+	"${AWK_PROG}"
+
+STATUS="${PIPESTATUS[0]}"
+restore_terminal
+exit "${STATUS}"
