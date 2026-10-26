@@ -346,8 +346,14 @@ on_fatal_signal() {
 	exit "$1"
 }
 
-# ^Z: give the terminal back as it was, then stop the whole pipeline.
+# ^Z: give the terminal back as it was, then stop the whole pipeline. bash 3.2
+# runs this trap a second time when the pipeline continues, as if the ^Z were
+# still pending; that second run must not stop everything again.
 on_tstp() {
+	if [[ -n "${IN_TSTP}" ]] ; then
+		return
+	fi
+	IN_TSTP=1
 	if [[ -n "${SAVED_STTY}" ]] ; then
 		discard_typeahead
 		stty "${SAVED_STTY}" 2> /dev/null < /dev/tty
@@ -357,6 +363,7 @@ on_tstp() {
 		printf '\033[23;2t' 2> /dev/null > /dev/tty
 	fi
 	kill -STOP 0
+	IN_TSTP=""
 }
 
 # fg: take the terminal again, and tell awk to carry on below whatever the
