@@ -143,6 +143,8 @@ prettyping parameters:
                          (default: enabled)
     --[no]title        Enable/disable showing the latency in the terminal
                          title. (default: enabled)
+    --[no]clear        Enable/disable clearing the screen at the start.
+                         (default: enabled)
     --[no]terminal     Force the output designed to a terminal. (default: auto)
     --last <n>         Use the last "n" pings at the statistics line.
                          (default: 60)

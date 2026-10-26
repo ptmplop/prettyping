@@ -52,6 +52,8 @@ prettyping parameters:
                        (default: enabled)
   --[no]title        Enable/disable showing the latency in the terminal title.
                        (default: enabled)
+  --[no]clear        Enable/disable clearing the screen at the start.
+                       (default: enabled)
   --[no]terminal     Force the output designed to a terminal. (default: auto)
   --last <n>         Use the last "n" pings at the statistics line. (default: 60)
   --columns <n>      Override auto-detection of terminal dimensions.
@@ -100,6 +102,7 @@ parse_arguments() {
 	USE_RECENTSTATS=1
 	USE_SUMMARY=1
 	USE_TITLE=1
+	USE_CLEAR=1
 	FORCED_COLOR=0
 	COLOR_DEPTH=auto
 	THEME=auto
@@ -181,6 +184,8 @@ parse_arguments() {
 			-nosummary     | --nosummary     ) USE_SUMMARY=0 ;;
 			-title         | --title         ) USE_TITLE=1 ;;
 			-notitle       | --notitle       ) USE_TITLE=0 ;;
+			-clear         | --clear         ) USE_CLEAR=1 ;;
+			-noclear       | --noclear       ) USE_CLEAR=0 ;;
 			-terminal      | --terminal      ) IS_TERMINAL=1 ;;
 			-noterminal    | --noterminal    ) IS_TERMINAL=0 ;;
 
@@ -2537,6 +2542,7 @@ BEGIN {
 	USE_RECENTSTATS += 0
 	USE_SUMMARY += 0
 	USE_TITLE += 0
+	USE_CLEAR += 0
 	LAST_N = int(LAST_N)
 	OVERRIDE_COLUMNS = int(OVERRIDE_COLUMNS)
 	OVERRIDE_LINES = int(OVERRIDE_LINES)
@@ -2588,6 +2594,8 @@ BEGIN {
 	SFW["loss"] = 11
 
 	if ( IS_TERMINAL ) {
+		# Start on a clean screen; what was on it stays in the scrollback.
+		if ( USE_CLEAR ) OUT = OUT CSI "H" CSI "2J"
 		OUT = OUT CSI "?25l"
 		if ( USE_TITLE ) OUT = OUT CSI "22;2t"
 		flush()
@@ -2726,6 +2734,7 @@ fi
 	-v USE_RECENTSTATS="${USE_RECENTSTATS}" \
 	-v USE_SUMMARY="${USE_SUMMARY}" \
 	-v USE_TITLE="${USE_TITLE}" \
+	-v USE_CLEAR="${USE_CLEAR}" \
 	-v LAST_N="${LAST_N}" \
 	-v OVERRIDE_COLUMNS="${OVERRIDE_COLUMNS}" \
 	-v OVERRIDE_LINES="${OVERRIDE_LINES}" \

@@ -422,6 +422,23 @@ def test_dumb_terminal(cfg, pyte):
     return errors, "\n".join(screen.display)
 
 
+def test_clear_screen(cfg, pyte):
+    """The screen is cleared at the start, unless --noclear; piped output never is."""
+    errors = []
+    for extra, want in (((), True), (("--noclear",), False)):
+        path, cmd = screen_cmd(cfg, [14, 15], *extra)
+        try:
+            screen, snaps, raw = run_pty(pyte, 100, 30, cmd)
+        finally:
+            os.unlink(path)
+        if (b"\x1b[H\x1b[2J" in raw) != want:
+            errors.append(f"{' '.join(extra) or 'default'}: cleared={not want}")
+    _, out = run_piped(cfg, [14, 15])
+    if "\x1b[2J" in out:
+        errors.append("piped output cleared the screen")
+    return errors, ""
+
+
 def test_late_repaint(cfg, pyte):
     """A late reply turns its cross back into a bar."""
     path, cmd = screen_cmd(cfg, [14, 15, "lost", 16, "late 1 20", 15, "wait"])
@@ -504,6 +521,7 @@ def main():
             ("screen resize while silent", lambda: test_resize_while_silent(cfg, pyte) if pyte else None),
             ("screen TERM=dumb", lambda: test_dumb_terminal(cfg, pyte) if pyte else None),
             ("screen late repaint", lambda: test_late_repaint(cfg, pyte) if pyte else None),
+            ("screen cleared at the start", lambda: test_clear_screen(cfg, pyte) if pyte else None),
         ]
         for name, fn in tests:
             if a.k and a.k not in name:
